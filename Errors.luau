@@ -1,5 +1,4 @@
 --!strict
-
 local Types = require(script.Parent.Types)
 
 type NexusError = Types.NexusError
@@ -58,9 +57,12 @@ end
 
 function Errors.IsThrottle(ErrorString : string) : boolean
 	local LowerCase = string.lower(ErrorString)
-	return string.find(LowerCase, "request was throttled") ~= nil
-		or string.find(LowerCase, "too many requests") ~= nil
-		or string.find(LowerCase, "budget") ~= nil
+	if string.find(LowerCase, "request was throttled") then return true end
+	if string.find(LowerCase, "too many requests") then return true end
+	if string.find(LowerCase, "budget") then return true end
+	if string.find(LowerCase, "gameserverthrottled") then return true end
+	if string.find(LowerCase, "experiencethrottled") then return true end
+	return false
 end
 
 function Errors.Format(Error : NexusError) : string

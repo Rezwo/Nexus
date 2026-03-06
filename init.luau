@@ -1,5 +1,4 @@
 --!strict
-
 local Types = require(script.Types)
 local Errors = require(script.Errors)
 local Store = require(script.Store)
@@ -11,6 +10,7 @@ local Leaderboard = require(script.Leaderboard)
 local PlayerStoreModule = require(script.PlayerStore)
 local Telemetry = require(script.Telemetry)
 local InboxModule = require(script.Inbox)
+local Budget = require(script.Budget)
 
 export type Result<Value> = Types.Result<Value>
 export type SuccessResult<Value> = Types.SuccessResult<Value>
@@ -75,6 +75,25 @@ function Nexus.GetWriteSemaphoreInfo() : {
 	return Semaphore.Global:GetInfo()
 end
 
+Nexus.Budget = Budget
+
+function Nexus.SetRateLimit(
+	RequestType : Enum.DataStoreRequestType,
+	BaseLimit : number,
+	PerPlayerLimit : number
+) : ()
+	local DataStoreService = game:GetService("DataStoreService")
+	local Success, ErrorMessage = pcall(function()
+		(DataStoreService :: any):SetRateLimitForRequestType(RequestType, BaseLimit, PerPlayerLimit)
+		return nil :: any
+	end)
+	if not Success then
+		warn(`[Nexus] SetRateLimit failed: {ErrorMessage}. This API requires April 2026+ runtime.`)
+	end
+end
+
+Nexus.IsModernBudgetActive = Budget.IsModernBudgetActive
+
 function Nexus.CreateLeaderboard(
 	Configuration : LeaderboardConfiguration
 ) : Leaderboard.LeaderboardObject
@@ -93,7 +112,7 @@ function Nexus.CreateInbox(
 	return InboxModule.New(Configuration)
 end
 
-Nexus.VERSION = "3.3.2"
+Nexus.VERSION = "3.4.0"
 
 Nexus.LockMode = {
 	Session = "Session" :: Types.LockMode,
