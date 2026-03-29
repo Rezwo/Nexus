@@ -4,7 +4,6 @@ local DataStoreService = game:GetService("DataStoreService")
 local Errors = require(script.Parent.Errors)
 local Types = require(script.Parent.Types)
 
-type NexusError = Types.NexusError
 type Result<Value> = Types.Result<Value>
 
 local Budget = {}
@@ -13,18 +12,7 @@ local LOW_BUDGET_THRESHOLD = 5
 local DRAIN_INTERVAL = 0.5
 local MAXIMUM_QUEUE_WAIT = 60
 
-local LEGACY_REQUEST_TYPE_MAP : { [Types.BudgetType] : Enum.DataStoreRequestType } = {
-	GetAsync = Enum.DataStoreRequestType.GetAsync,
-	SetIncrementAsync = Enum.DataStoreRequestType.SetIncrementAsync,
-	UpdateAsync = Enum.DataStoreRequestType.UpdateAsync,
-	GetSortedAsync = Enum.DataStoreRequestType.GetSortedAsync,
-	SetIncrementSortedAsync = Enum.DataStoreRequestType.SetIncrementSortedAsync,
-	OnUpdate = Enum.DataStoreRequestType.OnUpdate,
-	GetVersionAsync = Enum.DataStoreRequestType.GetVersionAsync,
-	ListAsync = Enum.DataStoreRequestType.ListAsync,
-}
-
-local MODERN_REQUEST_TYPE_MAP : { [Types.BudgetType] : { Enum.DataStoreRequestType } } = {
+local REQUEST_TYPE_MAP : { [Types.BudgetType] : { Enum.DataStoreRequestType } } = {
 	GetAsync = { Enum.DataStoreRequestType.StandardRead },
 	SetIncrementAsync = { Enum.DataStoreRequestType.StandardWrite },
 	UpdateAsync = { Enum.DataStoreRequestType.StandardRead, Enum.DataStoreRequestType.StandardWrite },
@@ -35,18 +23,6 @@ local MODERN_REQUEST_TYPE_MAP : { [Types.BudgetType] : { Enum.DataStoreRequestTy
 	ListAsync = { Enum.DataStoreRequestType.StandardList },
 }
 
-local UseModernBudgets : boolean = false
-local DetectionDone : boolean = false
-
-local function DetectBudgetSystem() : ()
-	if DetectionDone then return end
-	DetectionDone = true
-	local ModernBudget = DataStoreService:GetRequestBudgetForRequestType(
-		Enum.DataStoreRequestType.StandardRead
-	)
-	UseModernBudgets = ModernBudget > 0
-end
-
 type QueuedOperation = {
 	Thread : thread,
 	EnqueuedAt : number,
@@ -56,24 +32,16 @@ local OperationQueues : { [Types.BudgetType] : { QueuedOperation } } = {}
 local DrainerRunning = false
 
 function Budget.Get(RequestBudgetType : Types.BudgetType) : number
-	DetectBudgetSystem()
-
-	if UseModernBudgets then
-		local ModernEnums = MODERN_REQUEST_TYPE_MAP[RequestBudgetType]
-		if not ModernEnums then return 0 end
-		local MinBudget = math.huge
-		for _, EnumValue in ModernEnums do
-			local CurrentBudget = DataStoreService:GetRequestBudgetForRequestType(EnumValue)
-			if CurrentBudget < MinBudget then
-				MinBudget = CurrentBudget
-			end
+	local Enums = REQUEST_TYPE_MAP[RequestBudgetType]
+	if not Enums then return 0 end
+	local MinBudget = math.huge
+	for _, EnumValue in Enums do
+		local CurrentBudget = DataStoreService:GetRequestBudgetForRequestType(EnumValue)
+		if CurrentBudget < MinBudget then
+			MinBudget = CurrentBudget
 		end
-		return if MinBudget == math.huge then 0 else MinBudget
 	end
-
-	local LegacyEnum = LEGACY_REQUEST_TYPE_MAP[RequestBudgetType]
-	if not LegacyEnum then return 0 end
-	return DataStoreService:GetRequestBudgetForRequestType(LegacyEnum)
+	return if MinBudget == math.huge then 0 else MinBudget
 end
 
 function Budget.HasCapacity(RequestBudgetType : Types.BudgetType) : boolean
@@ -123,7 +91,7 @@ end
 
 function Budget.GetQueueInfo() : { [Types.BudgetType] : { QueueDepth : number, CurrentBudget : number } }
 	local Information : { [Types.BudgetType] : { QueueDepth : number, CurrentBudget : number } } = {}
-	for RequestBudgetType, _ in LEGACY_REQUEST_TYPE_MAP do
+	for RequestBudgetType, _ in REQUEST_TYPE_MAP do
 		local Queue = OperationQueues[RequestBudgetType]
 		Information[RequestBudgetType] = {
 			QueueDepth = if Queue then #Queue else 0,
@@ -131,16 +99,6 @@ function Budget.GetQueueInfo() : { [Types.BudgetType] : { QueueDepth : number, C
 		}
 	end
 	return Information
-end
-
-function Budget.IsModernBudgetActive() : boolean
-	DetectBudgetSystem()
-	return UseModernBudgets
-end
-
-function Budget.RedetectBudgetSystem() : ()
-	DetectionDone = false
-	DetectBudgetSystem()
 end
 
 function Budget._EnsureDrainer() : ()

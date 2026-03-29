@@ -82,17 +82,9 @@ function Nexus.SetRateLimit(
 	BaseLimit : number,
 	PerPlayerLimit : number
 ) : ()
-	local DataStoreService = game:GetService("DataStoreService")
-	local Success, ErrorMessage = pcall(function()
-		(DataStoreService :: any):SetRateLimitForRequestType(RequestType, BaseLimit, PerPlayerLimit)
-		return nil :: any
-	end)
-	if not Success then
-		warn(`[Nexus] SetRateLimit failed: {ErrorMessage}. This API requires April 2026+ runtime.`)
-	end
+	local DataStoreService = game:GetService("DataStoreService");
+	(DataStoreService :: any):SetRateLimitForRequestType(RequestType, BaseLimit, PerPlayerLimit)
 end
-
-Nexus.IsModernBudgetActive = Budget.IsModernBudgetActive
 
 function Nexus.CreateLeaderboard(
 	Configuration : LeaderboardConfiguration
@@ -112,7 +104,7 @@ function Nexus.CreateInbox(
 	return InboxModule.New(Configuration)
 end
 
-Nexus.VERSION = "3.4.0"
+Nexus.VERSION = "3.5.0"
 
 Nexus.LockMode = {
 	Session = "Session" :: Types.LockMode,

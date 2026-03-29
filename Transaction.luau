@@ -160,7 +160,7 @@ function Transaction.ExecuteOptimistic(
 	end
 
 	return {
-		Ok = AllSucceeded,
+		Passed = AllSucceeded,
 		Results = Results,
 	}
 end
