@@ -10,22 +10,14 @@ type MigrationStep = Types.MigrationStep
 
 local Schema = {}
 
-function Schema.ApplyDefaults<DataType>(
-	ExistingData : { [string] : unknown },
-	Defaults : DataType
-) : { [string] : unknown }
-	local DefaultTable = (Defaults :: any) :: { [string] : unknown }
-	local MergedData = Validation.DeepClone(ExistingData)
-
-	Schema._ReconcileTable(MergedData, DefaultTable)
-
-	return MergedData
-end
-
 local function IsArrayLike(Table : { [string] : unknown }) : boolean
-
 	if next(Table) == nil then
 		return false
+	end
+	for k in pairs(Table) do
+		if typeof(k) ~= "number" then
+			return false
+		end
 	end
 	return (Table :: any)[1] ~= nil
 end
@@ -34,25 +26,30 @@ function Schema._ReconcileTable(
 	Target : { [string] : unknown },
 	Source : { [string] : unknown }
 ) : ()
-
 	if IsArrayLike(Source) or IsArrayLike(Target) then
 		return
 	end
 	for Key, DefaultValue in Source do
 		local ExistingValue = Target[Key]
-
 		if ExistingValue == nil then
-
 			Target[Key] = Validation.DeepClone(DefaultValue)
 		elseif typeof(ExistingValue) == "table" and typeof(DefaultValue) == "table" then
-
 			Schema._ReconcileTable(
 				ExistingValue :: { [string] : unknown },
 				DefaultValue :: { [string] : unknown }
 			)
 		end
-
 	end
+end
+
+function Schema.ApplyDefaults<DataType>(
+	ExistingData : { [string] : unknown },
+	Defaults : DataType
+) : { [string] : unknown }
+	local DefaultTable = (Defaults :: any) :: { [string] : unknown }
+	local MergedData = Validation.DeepClone(ExistingData)
+	Schema._ReconcileTable(MergedData, DefaultTable)
+	return MergedData
 end
 
 function Schema.Migrate<DataType>(
@@ -72,7 +69,7 @@ function Schema.Migrate<DataType>(
 		return Errors.Fail(Errors.New(
 			"MigrationFailed",
 			`Data version ({FromVersion}) is newer than schema version ({TargetVersion}). Downgrade not supported.`
-		))
+			))
 	end
 
 	local CurrentData = Validation.DeepClone(Data)
@@ -83,7 +80,6 @@ function Schema.Migrate<DataType>(
 		table.sort(SortedMigrations, function(StepA : MigrationStep, StepB : MigrationStep)
 			return StepA.Version < StepB.Version
 		end)
-
 		for _, Step in SortedMigrations do
 			if Step.Version > CurrentVersion and Step.Version <= TargetVersion then
 				local MigrationSuccess, MigrationResult = pcall(Step.Up, CurrentData)
@@ -92,7 +88,7 @@ function Schema.Migrate<DataType>(
 						"MigrationFailed",
 						`Migration to version {Step.Version} failed: {MigrationResult}`,
 						{ Cause = tostring(MigrationResult) }
-					))
+						))
 				end
 				CurrentData = MigrationResult :: { [string] : unknown }
 				CurrentVersion = Step.Version
@@ -109,7 +105,7 @@ function Schema.Migrate<DataType>(
 				"ValidationFailed",
 				`Post-migration validation failed: {ValidationReason or "unknown"}`,
 				{ Cause = ValidationReason }
-			))
+				))
 		end
 	end
 
