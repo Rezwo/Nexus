@@ -1,141 +1,154 @@
 --!strict
 
 local Errors = require(script.Parent.Errors)
-local Types = require(script.Parent.Types)
+local Types  = require(script.Parent.Types)
 
 type Result<Value> = Types.Result<Value>
-type BudgetType = Types.BudgetType
 
-local MemoryBudget = {}
+-- ── Per-resource state ────────────────────────────────────────────────────────
+-- Keyed by an arbitrary discriminator string (typically the Store name).
+-- A failure in one resource cannot trigger backoff in another.
 
-local DRAIN_INTERVAL = 0.5
+local DRAIN_INTERVAL    = 0.5
 local MAXIMUM_QUEUE_WAIT = 30
-local FAILURE_WINDOW = 10
+local FAILURE_WINDOW    = 10
 local FAILURE_THRESHOLD = 5
-local BACKOFF_DURATION = 5
+local BACKOFF_DURATION  = 5
 
 type QueuedOperation = {
-	Thread : thread,
+	Thread     : thread,
 	EnqueuedAt : number,
 }
 
-local OperationQueues : { [BudgetType] : { QueuedOperation } } = {}
-local DrainerRunning = false
-local RecentFailures : { number } = {}
-local BackoffUntil = 0
+type ResourceBucket = {
+	Failures     : { number },
+	BackoffUntil : number,
+	Queues       : { [string] : { QueuedOperation } },
+	Draining     : boolean,
+}
 
-local function PruneFailures() : number
-	local Cutoff = os.clock() - FAILURE_WINDOW
+local Buckets : { [string] : ResourceBucket } = {}
+
+local function GetBucket(Resource : string) : ResourceBucket
+	local ExistingBucket = Buckets[Resource]
+	if ExistingBucket then return ExistingBucket end
+	local NewBucket : ResourceBucket = {
+		Failures     = {},
+		BackoffUntil = 0,
+		Queues       = {},
+		Draining     = false,
+	}
+	Buckets[Resource] = NewBucket
+	return NewBucket
+end
+
+local function PruneFailures(Bucket : ResourceBucket) : number
+	local Cutoff      = os.clock() - FAILURE_WINDOW
+	local WriteIndex  = 1
 	local ActiveCount = 0
-	local WriteIndex = 1
-	for ReadIndex = 1, #RecentFailures do
-		if RecentFailures[ReadIndex] >= Cutoff then
-			RecentFailures[WriteIndex] = RecentFailures[ReadIndex]
+	for ReadIndex = 1, #Bucket.Failures do
+		if Bucket.Failures[ReadIndex] >= Cutoff then
+			Bucket.Failures[WriteIndex] = Bucket.Failures[ReadIndex]
 			WriteIndex += 1
 			ActiveCount += 1
 		end
 	end
-	for ClearIndex = WriteIndex, #RecentFailures do
-		RecentFailures[ClearIndex] = nil :: any
+	for ClearIndex = WriteIndex, #Bucket.Failures do
+		Bucket.Failures[ClearIndex] = nil :: any
 	end
 	return ActiveCount
 end
 
-local function IsInBackoff() : boolean
-	if os.clock() < BackoffUntil then return true end
-	local ActiveFailures = PruneFailures()
+local function IsInBackoff(Bucket : ResourceBucket) : boolean
+	if os.clock() < Bucket.BackoffUntil then return true end
+	local ActiveFailures = PruneFailures(Bucket)
 	if ActiveFailures >= FAILURE_THRESHOLD then
-		BackoffUntil = os.clock() + BACKOFF_DURATION
+		Bucket.BackoffUntil = os.clock() + BACKOFF_DURATION
 		return true
 	end
 	return false
 end
 
-function MemoryBudget.Get(RequestBudgetType : BudgetType) : number
-	if IsInBackoff() then return 0 end
-	return FAILURE_THRESHOLD - #RecentFailures
+-- ── Public API (resource-scoped) ──────────────────────────────────────────────
+
+local MemoryBudget = {}
+
+function MemoryBudget.RecordFailure(Resource : string) : ()
+	local Bucket = GetBucket(Resource)
+	table.insert(Bucket.Failures, os.clock())
 end
 
-function MemoryBudget.ShouldAttempt() : boolean
-	return not IsInBackoff()
-end
-
-function MemoryBudget.RecordFailure() : ()
-	table.insert(RecentFailures, os.clock())
-end
-
-function MemoryBudget.RecordSuccess() : ()
-end
-
-function MemoryBudget.HasCapacity(RequestBudgetType : BudgetType) : boolean
-	if IsInBackoff() then return false end
-	return true
-end
-
-function MemoryBudget.WaitForCapacity(RequestBudgetType : BudgetType) : Result<boolean>
-	if MemoryBudget.HasCapacity(RequestBudgetType) then
-		return Errors.Passed(true)
+function MemoryBudget.RecordSuccess(Resource : string) : ()
+	-- Successful operations erode the failure window by removing one entry.
+	-- This provides faster recovery when errors are intermittent.
+	local Bucket = GetBucket(Resource)
+	if #Bucket.Failures > 0 then
+		table.remove(Bucket.Failures, 1)
 	end
+end
 
-	if not OperationQueues[RequestBudgetType] then
-		OperationQueues[RequestBudgetType] = {}
-	end
+function MemoryBudget.ShouldAttempt(Resource : string) : boolean
+	return not IsInBackoff(GetBucket(Resource))
+end
+
+function MemoryBudget.HasCapacity(Resource : string) : boolean
+	return not IsInBackoff(GetBucket(Resource))
+end
+
+function MemoryBudget.WaitForCapacity(Resource : string) : Result<boolean>
+	local Bucket = GetBucket(Resource)
+	if not IsInBackoff(Bucket) then return Errors.Passed(true) end
+
+	if not Bucket.Queues["_default"] then Bucket.Queues["_default"] = {} end
 
 	local Entry : QueuedOperation = {
-		Thread = coroutine.running(),
+		Thread     = coroutine.running(),
 		EnqueuedAt = os.clock(),
 	}
-	table.insert(OperationQueues[RequestBudgetType], Entry)
-
-	MemoryBudget._EnsureDrainer()
+	table.insert(Bucket.Queues["_default"], Entry)
+	MemoryBudget._EnsureDrainer(Resource)
 
 	local ResumedWithSuccess : boolean = coroutine.yield()
 	if ResumedWithSuccess then
 		return Errors.Passed(true)
-	else
-		return Errors.Fail(Errors.New("BudgetExhausted",
-			`MemoryStore budget for {RequestBudgetType} not available after {MAXIMUM_QUEUE_WAIT}s`
-			))
 	end
+	return Errors.Fail(Errors.New("BudgetExhausted",
+		`MemoryStore budget for '{Resource}' not available after {MAXIMUM_QUEUE_WAIT}s`))
 end
 
-function MemoryBudget.GetQueueInfo() : { [BudgetType] : { QueueDepth : number, CurrentBudget : number } }
-	local Information : { [BudgetType] : { QueueDepth : number, CurrentBudget : number } } = {}
-	local AllTypes : { BudgetType } = {
-		"GetAsync", "SetIncrementAsync", "UpdateAsync", "GetSortedAsync",
-		"SetIncrementSortedAsync", "OnUpdate", "GetVersionAsync", "ListAsync",
-	}
-	for _, RequestBudgetType in AllTypes do
-		local Queue = OperationQueues[RequestBudgetType]
-		Information[RequestBudgetType] = {
-			QueueDepth = if Queue then #Queue else 0,
-			CurrentBudget = MemoryBudget.Get(RequestBudgetType),
-		}
-	end
-	return Information
-end
-
-function MemoryBudget.GetStatus() : {
-	InBackoff : boolean,
-	BackoffRemaining : number,
+function MemoryBudget.GetStatus(Resource : string) : {
+	InBackoff          : boolean,
+	BackoffRemaining   : number,
 	RecentFailureCount : number,
 	}
-	local Now = os.clock()
+	local Bucket     = GetBucket(Resource)
+	local CurrentTime = os.clock()
 	return {
-		InBackoff = IsInBackoff(),
-		BackoffRemaining = math.max(0, BackoffUntil - Now),
-		RecentFailureCount = #RecentFailures,
+		InBackoff          = IsInBackoff(Bucket),
+		BackoffRemaining   = math.max(0, Bucket.BackoffUntil - CurrentTime),
+		RecentFailureCount = #Bucket.Failures,
 	}
 end
 
-function MemoryBudget.Reset() : ()
-	table.clear(RecentFailures)
-	BackoffUntil = 0
+function MemoryBudget.Reset(Resource : string?) : ()
+	if Resource then
+		local Bucket = Buckets[Resource]
+		if Bucket then
+			table.clear(Bucket.Failures)
+			Bucket.BackoffUntil = 0
+		end
+	else
+		-- Global reset (test helper)
+		table.clear(Buckets)
+	end
 end
 
-function MemoryBudget._EnsureDrainer() : ()
-	if DrainerRunning then return end
-	DrainerRunning = true
+-- ── Drainer (one per resource, self-terminating) ──────────────────────────────
+
+function MemoryBudget._EnsureDrainer(Resource : string) : ()
+	local Bucket = GetBucket(Resource)
+	if Bucket.Draining then return end
+	Bucket.Draining = true
 
 	task.spawn(function()
 		while true do
@@ -143,24 +156,24 @@ function MemoryBudget._EnsureDrainer() : ()
 			local AnyPending = false
 			local CurrentTime = os.clock()
 
-			for RequestBudgetType, Queue in OperationQueues do
+			for _QueueKey, Queue in Bucket.Queues do
 				if #Queue == 0 then continue end
 				AnyPending = true
 
-				while #Queue > 0 and MemoryBudget.HasCapacity(RequestBudgetType) do
-					local Entry = table.remove(Queue, 1) :: QueuedOperation
-					if CurrentTime - Entry.EnqueuedAt > MAXIMUM_QUEUE_WAIT then
-						task.spawn(Entry.Thread, false)
+				while #Queue > 0 and not IsInBackoff(Bucket) do
+					local QueueEntry = table.remove(Queue, 1) :: QueuedOperation
+					if CurrentTime - QueueEntry.EnqueuedAt > MAXIMUM_QUEUE_WAIT then
+						task.spawn(QueueEntry.Thread, false)
 					else
-						task.spawn(Entry.Thread, true)
+						task.spawn(QueueEntry.Thread, true)
 					end
 				end
 
 				local Index = 1
 				while Index <= #Queue do
 					if CurrentTime - Queue[Index].EnqueuedAt > MAXIMUM_QUEUE_WAIT then
-						local TimedOut = table.remove(Queue, Index) :: QueuedOperation
-						task.spawn(TimedOut.Thread, false)
+						local TimedOutEntry = table.remove(Queue, Index) :: QueuedOperation
+						task.spawn(TimedOutEntry.Thread, false)
 					else
 						Index += 1
 					end
@@ -168,7 +181,7 @@ function MemoryBudget._EnsureDrainer() : ()
 			end
 
 			if not AnyPending then
-				DrainerRunning = false
+				Bucket.Draining = false
 				break
 			end
 		end

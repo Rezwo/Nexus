@@ -69,12 +69,13 @@ export type SchemaDefinition<DataType> = {
 }
 
 export type Envelope<DataType> = {
-	_v : number,
-	_c : boolean?,
-	_d : DataType | string,
+	_v   : number,           -- schema version
+	_txv : number?,          -- transaction version (CAS token), increments on every write
+	_c   : boolean?,
+	_d   : DataType | string,
 	_lock : LockInfo?,
-	_s : number?,
-	_deleted : boolean?,
+	_s   : number?,
+	_deleted  : boolean?,
 	_deletedAt : number?,
 }
 
@@ -116,6 +117,8 @@ export type StoreConfiguration<DataType> = {
 	SoftDeleteRetention : number?,
 	AuditLog : boolean?,
 	AuditLogSize : number?,
+	AuditPersistence : boolean?,
+	AuditShardThreshold : number?,
 	Debug : boolean?,
 	IdleTimeout : number?,
 	IdleCheckInterval : number?,

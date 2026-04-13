@@ -10,7 +10,7 @@ local Validation = require(script.Parent.Validation)
 local Lock = require(script.Parent.Lock)
 local Circuit = require(script.Parent.Circuit)
 local SessionModule = require(script.Parent.Session)
-local Transaction = require(script.Parent.Transaction)
+local _Transaction = require(script.Parent.Transaction)
 local Shard = require(script.Parent.Shard)
 local Compression = require(script.Parent.Compression)
 local Lifecycle = require(script.Parent.Lifecycle)
@@ -85,6 +85,7 @@ export type StoreObject<DataType> = {
 	_SoftDeleted : { [string] : { DeletedAt : number, EnvelopeSnapshot : unknown } },
 	_DebounceTimers : { [string] : thread },
 	_LastActivity : { [string] : number },
+	_LastKnownTxv : { [string] : number },
 	_Telemetry : TelemetryScope,
 	_Middleware : MiddlewarePipeline,
 	_Debug : boolean,
@@ -138,6 +139,7 @@ export type StoreObject<DataType> = {
 	_WriteEnvelope : (self : StoreObject<DataType>, Key : string, WriteEnvelope : Envelope<DataType>, UserIds : { number }?) -> Result<boolean>,
 	_WriteEnvelopeInner : (self : StoreObject<DataType>, Key : string, WriteEnvelope : Envelope<DataType>, UserIds : { number }?) -> Result<boolean>,
 	_PerformDebouncedSave : (self : StoreObject<DataType>, Key : string) -> Result<boolean>,
+	_CommitParticipantCAS : (self : StoreObject<DataType>, Key : string, Transform : (Data : DataType) -> DataType?, ExpectedTxv : number, UserIds : { number }?) -> Result<boolean>,
 	_RecordAudit : (self : StoreObject<DataType>, Key : string, Operation : string, Before : unknown?, After : unknown?) -> (),
 	_DebugLog : (self : StoreObject<DataType>, Operation : string, Key : string?, Elapsed : number?) -> (),
 	_TouchActivity : (self : StoreObject<DataType>, Key : string) -> (),
@@ -215,6 +217,7 @@ function Store.New<DataType>(Configuration : StoreConfiguration<DataType>) : Sto
 	self._SoftDeleted = {}
 	self._DebounceTimers = {}
 	self._LastActivity = {}
+	self._LastKnownTxv = {}
 	self._Telemetry = Telemetry.CreateScope(Configuration.Name)
 	self._Middleware = MiddlewareModule.New()
 
@@ -400,6 +403,16 @@ function Store.Load<DataType>(self : StoreObject<DataType>, Key : string) : Resu
 			LoadedData = MiddlewareResult :: DataType
 		end
 	end
+
+	-- Capture _txv from the raw envelope for CAS transactions.
+	local LoadedTxv = 0
+	if RawData ~= nil and typeof(RawData) == "table" then
+		local RawTxv = (RawData :: any)._txv
+		if typeof(RawTxv) == "number" then
+			LoadedTxv = RawTxv
+		end
+	end
+	self._LastKnownTxv[Key] = LoadedTxv
 
 	local NewSession = SessionModule.New({
 		Key = Key,
@@ -723,6 +736,7 @@ function Store.Close<DataType>(self : StoreObject<DataType>, Key : string) : Res
 	self._LastWriteTime[Key] = nil
 	self._ShardCounts[Key] = nil
 	self._LastActivity[Key] = nil
+	self._LastKnownTxv[Key] = nil
 
 	self.OnRelease:Fire(Key)
 	if self._Callbacks.OnRelease then self._Callbacks.OnRelease(Key) end
@@ -917,9 +931,20 @@ function Store._WriteEnvelopeInner<DataType>(
 		}
 
 		local ManifestResult = Retry.WrapPcall("DataStoreError", function()
-			self._DataStore:UpdateAsync(Key, function()
+			self._DataStore:UpdateAsync(Key, function(CurrentRemote : unknown)
+				-- Inherit and increment the remote transaction version.
+				local RemoteTransactionVersion = 0
+				if typeof(CurrentRemote) == "table" then
+					local RemoteTable = CurrentRemote :: any
+					if typeof(RemoteTable._txv) == "number" then
+						RemoteTransactionVersion = RemoteTable._txv
+					end
+				end
+				local NewManifest = table.clone(Manifest :: any)
+				NewManifest._txv = RemoteTransactionVersion + 1
+				self._LastKnownTxv[Key] = RemoteTransactionVersion + 1
 				local Metadata = { SchemaVersion = tostring(Manifest._v) }
-				return Manifest :: any, UserIds or {}, Metadata
+				return NewManifest, UserIds or {}, Metadata
 			end)
 			return true
 		end, { MaxRetries = RetryCount, BudgetType = "UpdateAsync" } :: any)
@@ -937,9 +962,21 @@ function Store._WriteEnvelopeInner<DataType>(
 	end
 
 	local SaveResult = Retry.WrapPcall("DataStoreError", function()
-		self._DataStore:UpdateAsync(Key, function()
+		self._DataStore:UpdateAsync(Key, function(CurrentRemote : unknown)
+			-- Inherit and increment the remote transaction version.
+			-- This makes _txv a reliable CAS token even outside explicit transactions.
+			local RemoteTransactionVersion = 0
+			if typeof(CurrentRemote) == "table" then
+				local RemoteTable = CurrentRemote :: any
+				if typeof(RemoteTable._txv) == "number" then
+					RemoteTransactionVersion = RemoteTable._txv
+				end
+			end
+			local NewEnvelope = table.clone(WriteEnvelope :: any)
+			NewEnvelope._txv = RemoteTransactionVersion + 1
+			self._LastKnownTxv[Key] = RemoteTransactionVersion + 1
 			local Metadata = { SchemaVersion = tostring(WriteEnvelope._v) }
-			return WriteEnvelope :: any, UserIds or {}, Metadata
+			return NewEnvelope, UserIds or {}, Metadata
 		end)
 		return true
 	end, { MaxRetries = RetryCount, BudgetType = "UpdateAsync" } :: any)
@@ -967,8 +1004,11 @@ function Store.SaveOptimistic<DataType>(self : StoreObject<DataType>, Key : stri
 	local ReplayedActionCount = #PendingActions
 
 	if (self._ShardCounts[Key] or 0) > 0 then
-		return Errors.Fail(Errors.New("Internal",
-			`Key '{Key}' is sharded. Optimistic saves are incompatible with sharded data.`, { Key = Key }))
+		-- Sharded payloads can't participate in the remote-replay CAS path because
+		-- the shard manifest carries no meaningful version token. The in-memory data
+		-- is already correct (pending actions are applied), so a regular save is
+		-- semantically identical and handles shards natively.
+		return self:_PerformDebouncedSave(Key)
 	end
 
 	TargetSession:SetStatus("Saving")
@@ -1076,67 +1116,238 @@ function Store.SaveOptimistic<DataType>(self : StoreObject<DataType>, Key : stri
 end
 
 
+-- Returns:
+--   Errors.Passed(true)     → committed
+--   Errors.Passed(false)    → CAS conflict (retry the transaction, not an error)
+--   Errors.Fail(...)        → hard DataStore error
+function Store._CommitParticipantCAS<DataType>(
+	self                     : StoreObject<DataType>,
+	Key                      : string,
+	Transform                : (Data : DataType) -> DataType?,
+	ExpectedTransactionVersion : number,
+	UserIds                  : { number }?
+) : Result<boolean>
+	local SchemaDefinition    = self._Configuration.Schema
+	local ShouldCompress      = self._Configuration.Compress or false
+	local CompressionThreshold = self._Configuration.CompressionThreshold or 4096
+	local CompressionLevel    = self._Configuration.CompressionLevel or 3
+	local CurrentLockManager  = self._LockManager
+
+	local WasConflict        = false
+	local TransformReturnedNil = false
+	local ValidationFailure  : string? = nil
+
+	local WriteResult = Retry.WrapPcall("DataStoreError", function()
+		self._DataStore:UpdateAsync(Key, function(CurrentRemote : unknown)
+			WasConflict        = false
+			TransformReturnedNil = false
+
+			-- ── CAS check ──────────────────────────────────────────────────
+			local RemoteTransactionVersion = 0
+			if typeof(CurrentRemote) == "table" then
+				local RemoteTable = CurrentRemote :: any
+				if typeof(RemoteTable._txv) == "number" then
+					RemoteTransactionVersion = RemoteTable._txv
+				end
+			end
+			if RemoteTransactionVersion ~= ExpectedTransactionVersion then
+				WasConflict = true
+				return nil  -- abort without writing; DataStore treats this as success
+			end
+
+			-- ── Unpack + transform ─────────────────────────────────────────
+			local UnpackResult = SessionModule.UnpackEnvelope(CurrentRemote, SchemaDefinition)
+			if not UnpackResult.Passed then
+				WasConflict = true   -- treat corrupt remote as a conflict; caller will retry
+				return nil
+			end
+			local RemoteData = (UnpackResult :: Types.SuccessResult<{ Data : DataType, Version : number }>).Value.Data
+
+			local TransformedData = Transform(RemoteData)
+			if TransformedData == nil then
+				TransformReturnedNil = true
+				return nil
+			end
+
+			-- ── Optional schema validation ─────────────────────────────────
+			if SchemaDefinition.Validate then
+				local IsValid, ValidationReason = SchemaDefinition.Validate(TransformedData)
+				if not IsValid then
+					ValidationFailure = ValidationReason or "validation failed"
+					return nil
+				end
+			end
+
+			-- ── Build new envelope ─────────────────────────────────────────
+			local PayloadData : DataType | string = TransformedData
+			local IsCompressed = false
+			if ShouldCompress then
+				local EstimatedSize = Compression.EstimateSize(TransformedData :: any)
+				if EstimatedSize > CompressionThreshold then
+					local CompressResult = Compression.Compress(TransformedData :: any, CompressionLevel)
+					if CompressResult.Passed then
+						PayloadData = (CompressResult :: Types.SuccessResult<string>).Value :: any
+						IsCompressed = true
+					end
+				end
+			end
+
+			local CommitEnvelope : Types.Envelope<DataType> = {
+				_v   = SchemaDefinition.Version,
+				_txv = RemoteTransactionVersion + 1,
+				_c   = if IsCompressed then true else nil,
+				_d   = PayloadData,
+			}
+			if CurrentLockManager then
+				local CurrentLockInfo = CurrentLockManager:ToLockInfo(Key)
+				if CurrentLockInfo then CommitEnvelope._lock = CurrentLockInfo end
+			end
+
+			self._LastKnownTxv[Key] = RemoteTransactionVersion + 1
+			local Metadata = { SchemaVersion = tostring(SchemaDefinition.Version) }
+			return CommitEnvelope, UserIds or {}, Metadata
+		end)
+		return true
+	end, { MaxRetries = self._Configuration.MaxRetries, BudgetType = "UpdateAsync" } :: any)
+
+	if not WriteResult.Passed then
+		return Errors.Fail((WriteResult :: Types.ErrorResult).Error)
+	end
+	if ValidationFailure then
+		return Errors.Fail(Errors.New("ValidationFailed", ValidationFailure, { Key = Key }))
+	end
+	if TransformReturnedNil then
+		return Errors.Fail(Errors.New("TransactionAborted",
+			`Transform returned nil for key '{Key}'`, { Key = Key }))
+	end
+	-- WasConflict = false means "committed"; true means "retry needed"
+	return Errors.Passed(not WasConflict)
+end
+
 function Store.Transact<DataType>(
-	self : StoreObject<DataType>,
-	Participants : { { Key : string, Transform : (Data : DataType) -> DataType? } },
+	self          : StoreObject<DataType>,
+	Participants  : { { Key : string, Transform : (Data : DataType) -> DataType? } },
 	Configuration : TransactionConfiguration?
 ) : TransactionResult
-	local TransactionInstance = Transaction.New(Configuration)
-	for _, ParticipantEntry in Participants do
-		TransactionInstance:Add(self, ParticipantEntry.Key, ParticipantEntry.Transform :: any)
-	end
+	local MaxRetryCount = (Configuration and Configuration.MaxRetries) or 3
+	local Results       : { [string] : Result<boolean> } = {}
 
-	if self._Configuration.Strict then
-		local StrictValidationResult = TransactionInstance:ValidateStrict(
-			function(StoreReference : unknown, Key : string) : unknown?
-				local TargetSession = (StoreReference :: StoreObject<DataType>)._Sessions[Key]
-				if TargetSession then return TargetSession._Data end
-				return nil
-			end)
-		if not StrictValidationResult.Passed then
-			return { Passed = false, Error = (StrictValidationResult :: Types.ErrorResult).Error, Results = {} }
+	for Attempt = 1, MaxRetryCount do
+
+		-- ── Snapshot current _txv and data for each participant ────────────
+		-- We re-read at the start of every retry so we're working from
+		-- the freshest remote state, not stale in-memory data.
+		local ParticipantSnapshots : { [string] : { TransactionVersion : number, Data : DataType } } = {}
+		for _, ParticipantEntry in Participants do
+			local TargetSession = self._Sessions[ParticipantEntry.Key]
+			if not TargetSession then
+				return {
+					Passed = false,
+					Error  = Errors.New("SessionNotFound",
+						`No active session for '{ParticipantEntry.Key}'`, { Key = ParticipantEntry.Key }),
+					Results = {},
+				}
+			end
+			local RemoteTransactionVersion = self._LastKnownTxv[ParticipantEntry.Key] or 0
+			ParticipantSnapshots[ParticipantEntry.Key] = {
+				TransactionVersion = RemoteTransactionVersion,
+				Data               = Validation.DeepClone(TargetSession._Data),
+			}
 		end
-	end
 
-	local TransactionParticipants = TransactionInstance:GetParticipants()
-	for Index, ParticipantData in TransactionParticipants do
-		local TargetSession = self._Sessions[ParticipantData.Key]
-		if TargetSession then
-			TransactionInstance:SetSnapshot(Index, Validation.DeepClone(TargetSession._Data))
-		end
-	end
+		-- ── Attempt CAS commit for each participant ────────────────────────
+		local CommittedKeys    : { string } = {}
+		local ConflictDetected = false
+		local HardError        : NexusError? = nil
 
-	return TransactionInstance:ExecuteOptimistic(
-		function(StoreReference : unknown, Key : string, Transform : (Data : unknown) -> unknown?) : Result<unknown>
-			local TypedStore = StoreReference :: StoreObject<DataType>
-			local TransformReturnedNil = false
-			local WrappedTransform = function(Data : DataType) : DataType?
-				local TransformResult = (Transform :: any)(Data)
-				if TransformResult == nil then
-					TransformReturnedNil = true
+		for _, ParticipantEntry in Participants do
+			local ParticipantSnapshot = ParticipantSnapshots[ParticipantEntry.Key]
+			local ParticipantUserIds  = self._Sessions[ParticipantEntry.Key]:GetUserIds()
+
+			local CommitResult = self:_CommitParticipantCAS(
+				ParticipantEntry.Key,
+				ParticipantEntry.Transform,
+				ParticipantSnapshot.TransactionVersion,
+				ParticipantUserIds)
+
+			if not CommitResult.Passed then
+				HardError = (CommitResult :: Types.ErrorResult).Error
+				-- Saga: compensate already-committed participants
+				for _, CommittedKey in CommittedKeys do
+					local RollbackSession = self._Sessions[CommittedKey]
+					if RollbackSession then
+						RollbackSession._Data  = ParticipantSnapshots[CommittedKey].Data
+						RollbackSession._Dirty = true
+						self:_PerformDebouncedSave(CommittedKey)
+					end
 				end
-				return TransformResult
+				return { Passed = false, Error = HardError, Results = Results }
 			end
-			local UpdateResult = TypedStore:Update(Key, WrappedTransform)
-			if TransformReturnedNil then
-				return Errors.Fail(Errors.New("TransactionAborted",
-					`Transform returned nil for key '{Key}'`, { Key = Key }))
+
+			local DidCommit = (CommitResult :: Types.SuccessResult<boolean>).Value
+			if not DidCommit then
+				-- CAS conflict on this key — another server wrote concurrently.
+				-- Roll back what we've committed this attempt and retry.
+				ConflictDetected = true
+				for _, CommittedKey in CommittedKeys do
+					local RollbackSession = self._Sessions[CommittedKey]
+					if RollbackSession then
+						RollbackSession._Data  = ParticipantSnapshots[CommittedKey].Data
+						RollbackSession._Dirty = true
+						self:_PerformDebouncedSave(CommittedKey)
+					end
+				end
+				break
 			end
-			return UpdateResult :: any
-		end,
-		function(StoreReference : unknown, Key : string, Snapshot : unknown) : Result<boolean>
-			local TypedStore = StoreReference :: StoreObject<DataType>
-			local TargetSession = TypedStore._Sessions[Key]
+
+			table.insert(CommittedKeys, ParticipantEntry.Key)
+			Results[ParticipantEntry.Key] = Errors.Passed(true)
+		end
+
+		if ConflictDetected then
+			if Attempt < MaxRetryCount then
+				-- Exponential backoff before retry; also re-read remote transaction version.
+				task.wait(0.1 * (2 ^ (Attempt - 1)) + math.random() * 0.1)
+				-- Re-sync _txv for conflicted keys from DataStore before next attempt.
+				for _, ParticipantEntry in Participants do
+					local PeekResult = Retry.WrapPcall("DataStoreError", function()
+						return self._DataStore:GetAsync(ParticipantEntry.Key)
+					end, { MaxRetries = 2, BudgetType = "GetAsync" } :: any)
+					if PeekResult.Passed then
+						local RawData = (PeekResult :: Types.SuccessResult<unknown>).Value
+						if typeof(RawData) == "table" then
+							local RemoteTable = RawData :: any
+							self._LastKnownTxv[ParticipantEntry.Key] = typeof(RemoteTable._txv) == "number" and RemoteTable._txv or 0
+						end
+					end
+				end
+			end
+			continue
+		end
+
+		-- ── All committed. Sync in-memory sessions. ────────────────────────
+		for _, ParticipantEntry in Participants do
+			local TargetSession = self._Sessions[ParticipantEntry.Key]
 			if TargetSession then
-				TargetSession._Data = Snapshot :: DataType
-				TargetSession._Dirty = true
-				local PersistResult = TypedStore:Save(Key)
-				if not PersistResult.Passed then
-					warn(`[Nexus] Transaction: rollback persist failed for '{Key}'`)
+				-- The transform has been applied remotely; apply it locally too
+				-- so in-memory state stays consistent without a full reload.
+				local TransformedData = ParticipantEntry.Transform(Validation.DeepClone(TargetSession._Data))
+				if TransformedData ~= nil then
+					TargetSession._Data  = TransformedData
+					TargetSession._Dirty = false
 				end
 			end
-			return Errors.Passed(true)
-		end)
+		end
+
+		return { Passed = true, Results = Results }
+	end
+
+	return {
+		Passed  = false,
+		Error   = Errors.New("TransactionConflict",
+			`Transaction failed after {MaxRetryCount} CAS retries`),
+		Results = Results,
+	}
 end
 
 function Store.ListVersions<DataType>(self : StoreObject<DataType>, Key : string, Options : ListVersionsOptions?) : Result<{ VersionInfo }>
