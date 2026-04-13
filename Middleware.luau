@@ -36,7 +36,13 @@ function Middleware.New() : MiddlewarePipeline
 		local CurrentData = Data
 		local ChainIndex = 0
 
-		local function RunNext() : unknown
+		local function RunNext(... : any) : unknown
+			local Args = { ... }
+			if #Args >= 2 then
+				CurrentData = Args[2]
+			elseif #Args == 1 and typeof(Args[1]) ~= "string" then
+				CurrentData = Args[1]
+			end
 			ChainIndex += 1
 			if ChainIndex > #Chain then
 				return CurrentData

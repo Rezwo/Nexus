@@ -65,7 +65,7 @@ function Circuit.IsOpen(self : CircuitBreaker) : boolean
 end
 
 function Circuit.RecordSuccess(self : CircuitBreaker) : ()
-	local State = self:GetState()
+	local State = self._State
 	if State == "HalfOpen" then
 		self._SuccessCount += 1
 		if self._SuccessCount >= self._HalfOpenSuccessThreshold then
@@ -77,7 +77,7 @@ function Circuit.RecordSuccess(self : CircuitBreaker) : ()
 end
 
 function Circuit.RecordServiceFailure(self : CircuitBreaker) : ()
-	local State = self:GetState()
+	local State = self._State
 	self._LastFailureTime = os.clock()
 
 	if State == "HalfOpen" then
@@ -93,33 +93,15 @@ end
 
 function Circuit.IsServiceError(ErrorString : string) : boolean
 	local LowerCase = string.lower(ErrorString)
-	if string.find(LowerCase, "internal") then
-		return true
-	end
-	if string.find(LowerCase, "unavailable") then
-		return true
-	end
-	if string.find(LowerCase, "timeout") then
-		return true
-	end
-	if string.find(LowerCase, "throttle") then
-		return true
-	end
-	if string.find(LowerCase, "too many requests") then
-		return true
-	end
-	if string.find(LowerCase, "service") then
-		return true
-	end
-	if string.find(LowerCase, "500") then
-		return true
-	end
-	if string.find(LowerCase, "502") then
-		return true
-	end
-	if string.find(LowerCase, "503") then
-		return true
-	end
+	if string.find(LowerCase, "internal") then return true end
+	if string.find(LowerCase, "unavailable") then return true end
+	if string.find(LowerCase, "timeout") then return true end
+	if string.find(LowerCase, "throttle") then return true end
+	if string.find(LowerCase, "too many requests") then return true end
+	if string.find(LowerCase, "service") then return true end
+	if string.find(LowerCase, "500") then return true end
+	if string.find(LowerCase, "502") then return true end
+	if string.find(LowerCase, "503") then return true end
 	return false
 end
 
@@ -140,7 +122,7 @@ function Circuit.GetInfo(self : CircuitBreaker) : {
 	SuccessCount : number,
 	LastFailureTime : number,
 	TimeSinceStateChange : number,
-}
+	}
 	return {
 		Name = self._Name,
 		State = self:GetState(),
@@ -157,9 +139,7 @@ end
 
 function Circuit._Transition(self : CircuitBreaker, NewState : CircuitState) : ()
 	local OldState = self._State
-	if OldState == NewState then
-		return
-	end
+	if OldState == NewState then return end
 
 	self._State = NewState
 	self._LastStateChangeTime = os.clock()
@@ -170,7 +150,7 @@ function Circuit._Transition(self : CircuitBreaker, NewState : CircuitState) : (
 	elseif NewState == "HalfOpen" then
 		self._SuccessCount = 0
 	end
-	
+
 	warn(`[Nexus:{self._Name}] Circuit {OldState} → {NewState}`)
 	self.OnStateChange:Fire(OldState, NewState)
 end

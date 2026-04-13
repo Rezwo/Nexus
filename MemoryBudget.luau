@@ -1,64 +1,49 @@
 --!strict
 
-local MemoryStoreService = game:GetService("MemoryStoreService")
-
 local Errors = require(script.Parent.Errors)
 local Types = require(script.Parent.Types)
 
 type Result<Value> = Types.Result<Value>
+type BudgetType = Types.BudgetType
 
 local MemoryBudget = {}
 
-local LOW_BUDGET_THRESHOLD = 3
 local DRAIN_INTERVAL = 0.5
 local MAXIMUM_QUEUE_WAIT = 30
-
-export type MemoryBudgetType =
-	"SortedMap"
-	| "HashMap"
-	| "Queue"
-
-local REQUEST_TYPE_MAP : { [MemoryBudgetType] : Enum.DataStoreRequestType } = {
-	SortedMap = Enum.DataStoreRequestType.SetIncrementAsync,
-	HashMap = Enum.DataStoreRequestType.SetIncrementAsync,
-	Queue = Enum.DataStoreRequestType.SetIncrementAsync,
-}
+local FAILURE_WINDOW = 10
+local FAILURE_THRESHOLD = 5
+local BACKOFF_DURATION = 5
 
 type QueuedOperation = {
 	Thread : thread,
 	EnqueuedAt : number,
 }
 
-local OperationQueues : { [MemoryBudgetType] : { QueuedOperation } } = {}
+local OperationQueues : { [BudgetType] : { QueuedOperation } } = {}
 local DrainerRunning = false
-
 local RecentFailures : { number } = {}
-local FAILURE_WINDOW = 10
-local FAILURE_THRESHOLD = 5
-local BACKOFF_DURATION = 5
 local BackoffUntil = 0
 
-local function RecordFailure() : ()
-	table.insert(RecentFailures, os.clock())
-end
-
-local function IsInBackoff() : boolean
-	if os.clock() < BackoffUntil then
-		return true
-	end
+local function PruneFailures() : number
 	local Cutoff = os.clock() - FAILURE_WINDOW
-	local ActiveFailures = 0
+	local ActiveCount = 0
 	local WriteIndex = 1
 	for ReadIndex = 1, #RecentFailures do
 		if RecentFailures[ReadIndex] >= Cutoff then
 			RecentFailures[WriteIndex] = RecentFailures[ReadIndex]
 			WriteIndex += 1
-			ActiveFailures += 1
+			ActiveCount += 1
 		end
 	end
 	for ClearIndex = WriteIndex, #RecentFailures do
 		RecentFailures[ClearIndex] = nil :: any
 	end
+	return ActiveCount
+end
+
+local function IsInBackoff() : boolean
+	if os.clock() < BackoffUntil then return true end
+	local ActiveFailures = PruneFailures()
 	if ActiveFailures >= FAILURE_THRESHOLD then
 		BackoffUntil = os.clock() + BACKOFF_DURATION
 		return true
@@ -66,24 +51,28 @@ local function IsInBackoff() : boolean
 	return false
 end
 
+function MemoryBudget.Get(RequestBudgetType : BudgetType) : number
+	if IsInBackoff() then return 0 end
+	return FAILURE_THRESHOLD - #RecentFailures
+end
+
 function MemoryBudget.ShouldAttempt() : boolean
 	return not IsInBackoff()
 end
 
 function MemoryBudget.RecordFailure() : ()
-	RecordFailure()
+	table.insert(RecentFailures, os.clock())
 end
 
 function MemoryBudget.RecordSuccess() : ()
-	-- intentionally empty
 end
 
-function MemoryBudget.HasCapacity(RequestBudgetType : MemoryBudgetType) : boolean
+function MemoryBudget.HasCapacity(RequestBudgetType : BudgetType) : boolean
 	if IsInBackoff() then return false end
 	return true
 end
 
-function MemoryBudget.WaitForCapacity(RequestBudgetType : MemoryBudgetType) : Result<boolean>
+function MemoryBudget.WaitForCapacity(RequestBudgetType : BudgetType) : Result<boolean>
 	if MemoryBudget.HasCapacity(RequestBudgetType) then
 		return Errors.Passed(true)
 	end
@@ -106,15 +95,31 @@ function MemoryBudget.WaitForCapacity(RequestBudgetType : MemoryBudgetType) : Re
 	else
 		return Errors.Fail(Errors.New("BudgetExhausted",
 			`MemoryStore budget for {RequestBudgetType} not available after {MAXIMUM_QUEUE_WAIT}s`
-		))
+			))
 	end
+end
+
+function MemoryBudget.GetQueueInfo() : { [BudgetType] : { QueueDepth : number, CurrentBudget : number } }
+	local Information : { [BudgetType] : { QueueDepth : number, CurrentBudget : number } } = {}
+	local AllTypes : { BudgetType } = {
+		"GetAsync", "SetIncrementAsync", "UpdateAsync", "GetSortedAsync",
+		"SetIncrementSortedAsync", "OnUpdate", "GetVersionAsync", "ListAsync",
+	}
+	for _, RequestBudgetType in AllTypes do
+		local Queue = OperationQueues[RequestBudgetType]
+		Information[RequestBudgetType] = {
+			QueueDepth = if Queue then #Queue else 0,
+			CurrentBudget = MemoryBudget.Get(RequestBudgetType),
+		}
+	end
+	return Information
 end
 
 function MemoryBudget.GetStatus() : {
 	InBackoff : boolean,
 	BackoffRemaining : number,
 	RecentFailureCount : number,
-}
+	}
 	local Now = os.clock()
 	return {
 		InBackoff = IsInBackoff(),

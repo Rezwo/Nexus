@@ -25,23 +25,23 @@ export type NexusError = {
 
 export type ErrorKind =
 	"Throttled"
-	| "DataStoreError"
-	| "MemoryStoreError"
-	| "SessionLocked"
-	| "SessionNotFound"
-	| "SessionClosed"
-	| "ValidationFailed"
-	| "MigrationFailed"
-	| "TransactionConflict"
-	| "TransactionAborted"
-	| "TransactionTimeout"
-	| "CompressionError"
-	| "SchemaError"
-	| "BudgetExhausted"
-	| "KeyNotFound"
-	| "StrictModeViolation"
-	| "Timeout"
-	| "Internal"
+| "DataStoreError"
+| "MemoryStoreError"
+| "SessionLocked"
+| "SessionNotFound"
+| "SessionClosed"
+| "ValidationFailed"
+| "MigrationFailed"
+| "TransactionConflict"
+| "TransactionAborted"
+| "TransactionTimeout"
+| "CompressionError"
+| "SchemaError"
+| "BudgetExhausted"
+| "KeyNotFound"
+| "StrictModeViolation"
+| "Timeout"
+| "Internal"
 
 export type Connection = {
 	Disconnect : (self : Connection) -> (),
@@ -117,12 +117,14 @@ export type StoreConfiguration<DataType> = {
 	AuditLog : boolean?,
 	AuditLogSize : number?,
 	Debug : boolean?,
+	IdleTimeout : number?,
+	IdleCheckInterval : number?,
 }
 
 export type LockMode =
 	"Session"
-	| "Optimistic"
-	| "None"
+| "Optimistic"
+| "None"
 
 export type TransactionParticipant<DataType> = {
 	Store : string,
@@ -156,13 +158,13 @@ export type VersionEntry<DataType> = {
 
 export type BudgetType =
 	"GetAsync"
-	| "SetIncrementAsync"
-	| "UpdateAsync"
-	| "GetSortedAsync"
-	| "SetIncrementSortedAsync"
-	| "OnUpdate"
-	| "GetVersionAsync"
-	| "ListAsync"
+| "SetIncrementAsync"
+| "UpdateAsync"
+| "GetSortedAsync"
+| "SetIncrementSortedAsync"
+| "OnUpdate"
+| "GetVersionAsync"
+| "ListAsync"
 
 export type RetryConfiguration = {
 	MaxRetries : number?,

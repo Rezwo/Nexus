@@ -82,7 +82,7 @@ function Nexus.GetWriteSemaphoreInfo() : {
 	MaxConcurrent : number,
 	ActiveCount : number,
 	QueueDepth : number,
-}
+	}
 	return Semaphore.Global:GetInfo()
 end
 
@@ -125,7 +125,20 @@ function Nexus.Transact(
 	return TransactionInstance:ExecuteOptimistic(
 		function(StoreReference : unknown, Key : string, Transform : (Data : unknown) -> unknown?) : Types.Result<unknown>
 			local TypedStore = StoreReference :: Store.StoreObject<any>
-			return TypedStore:Update(Key, Transform :: any) :: any
+			local TransformReturnedNil = false
+			local WrappedTransform = function(Data : any) : any?
+				local TransformResult = (Transform :: any)(Data)
+				if TransformResult == nil then
+					TransformReturnedNil = true
+				end
+				return TransformResult
+			end
+			local UpdateResult = TypedStore:Update(Key, WrappedTransform)
+			if TransformReturnedNil then
+				return Errors.Fail(Errors.New("TransactionAborted",
+					`Transform returned nil for key '{Key}'`, { Key = Key }))
+			end
+			return UpdateResult :: any
 		end,
 		function(StoreReference : unknown, Key : string, Snapshot : unknown) : Types.Result<boolean>
 			local TypedStore = StoreReference :: Store.StoreObject<any>

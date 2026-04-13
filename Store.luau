@@ -101,6 +101,7 @@ export type StoreObject<DataType> = {
 	LoadMany : (self : StoreObject<DataType>, Keys : { string }) -> BatchResult<DataType>,
 	Read : (self : StoreObject<DataType>, Key : string) -> Result<DataType>,
 	Update : (self : StoreObject<DataType>, Key : string, Transform : (Data : DataType) -> DataType?) -> Result<DataType>,
+	QueueAction : (self : StoreObject<DataType>, Key : string, Action : (Data : DataType) -> DataType?) -> Result<boolean>,
 	Save : (self : StoreObject<DataType>, Key : string) -> Result<boolean>,
 	Close : (self : StoreObject<DataType>, Key : string) -> Result<boolean>,
 	CloseAll : (self : StoreObject<DataType>) -> (),
@@ -112,13 +113,13 @@ export type StoreObject<DataType> = {
 	Rollback : (self : StoreObject<DataType>, Key : string, VersionId : string) -> Result<DataType>,
 	ListKeys : (self : StoreObject<DataType>, Prefix : string?, PageSize : number?, MaxPages : number?) -> Result<{ string }>,
 	ListKeysPage : (self : StoreObject<DataType>, Prefix : string?, PageSize : number?) -> Result<PageCursor>,
-	NextPage : (self : StoreObject<DataType>, Cursor : PageCursor) -> Result<{ string }>,
+	NextPage : (self : StoreObject<DataType>, Cursor : PageCursor) -> Result<{ Keys : { string }, Done : boolean }>,
 	SoftDelete : (self : StoreObject<DataType>, Key : string) -> Result<boolean>,
 	Recover : (self : StoreObject<DataType>, Key : string) -> Result<DataType>,
 	IsSoftDeleted : (self : StoreObject<DataType>, Key : string) -> boolean,
-	ListSoftDeleted : (self : StoreObject<DataType>) -> { SoftDeleteInfo },
+	ListSoftDeleted : (self : StoreObject<DataType>) -> Result<{ SoftDeleteInfo }>,
 	PurgeSoftDeleted : (self : StoreObject<DataType>, Key : string) -> Result<boolean>,
-	GetAuditLog : (self : StoreObject<DataType>, Key : string) -> { AuditEntry },
+	GetAuditLog : (self : StoreObject<DataType>, Key : string) -> Result<{ AuditEntry }>,
 	GetTelemetry : (self : StoreObject<DataType>) -> TelemetryScope,
 	Use : (self : StoreObject<DataType>, Phase : MiddlewarePhase, Handler : MiddlewareFn) -> (),
 	SetCallbacks : (self : StoreObject<DataType>, Callbacks : StoreCallbacks<DataType>) -> (),
@@ -185,6 +186,9 @@ function Store.New<DataType>(Configuration : StoreConfiguration<DataType>) : Sto
 		AuditLog = Configuration.AuditLog or false,
 		AuditLogSize = Configuration.AuditLogSize or DEFAULT_AUDIT_LOG_SIZE,
 		Debug = Configuration.Debug or false,
+		IdleTimeout = Configuration.IdleTimeout or DEFAULT_IDLE_THRESHOLD,
+		IdleCheckInterval = Configuration.IdleCheckInterval
+			or (if Configuration.IdleTimeout then math.max(Configuration.IdleTimeout / 2, 0.1) else 60),
 	}
 
 	self._Configuration = ResolvedConfiguration
@@ -305,6 +309,7 @@ function Store.Load<DataType>(self : StoreObject<DataType>, Key : string) : Resu
 		local FetchError = (FetchResult :: Types.ErrorResult).Error
 		FetchError.Key = Key
 		self.OnError:Fire(Key, FetchError)
+		if self._Callbacks.OnError then self._Callbacks.OnError(Key, FetchError) end
 		self._Telemetry:Record("Store.Load", os.clock() - StartTime, false, FetchError)
 		return Errors.Fail(FetchError)
 	end
@@ -326,6 +331,7 @@ function Store.Load<DataType>(self : StoreObject<DataType>, Key : string) : Resu
 				local ShardError = (ShardResult :: Types.ErrorResult).Error
 				ShardError.Key = Key
 				self.OnError:Fire(Key, ShardError)
+				if self._Callbacks.OnError then self._Callbacks.OnError(Key, ShardError) end
 				self._Telemetry:Record("Store.Load", os.clock() - StartTime, false, ShardError)
 				return Errors.Fail(ShardError)
 			end
@@ -363,6 +369,7 @@ function Store.Load<DataType>(self : StoreObject<DataType>, Key : string) : Resu
 		local UnpackError = (UnpackResult :: Types.ErrorResult).Error
 		UnpackError.Key = Key
 		self.OnError:Fire(Key, UnpackError)
+		if self._Callbacks.OnError then self._Callbacks.OnError(Key, UnpackError) end
 		self._Telemetry:Record("Store.Load", os.clock() - StartTime, false, UnpackError)
 		return Errors.Fail(UnpackError)
 	end
@@ -409,7 +416,7 @@ function Store.Load<DataType>(self : StoreObject<DataType>, Key : string) : Resu
 
 	self._Sessions[Key] = NewSession
 	self:_TouchActivity(Key)
-	self:_RecordAudit(Key, "Load", nil, LoadedData)
+	self:_RecordAudit(Key, "Load", Validation.DeepClone(LoadedData), LoadedData)
 
 	self.OnLoad:Fire(Key, LoadedData)
 	if self._Callbacks.OnLoad then self._Callbacks.OnLoad(Key, LoadedData) end
@@ -531,8 +538,24 @@ function Store.Update<DataType>(
 		if self._Configuration.AuditLog then
 			self:_RecordAudit(Key, "Update", Before, Validation.DeepClone(TargetSession._Data))
 		end
+	else
+		local UpdateError = (UpdateResult :: Types.ErrorResult).Error
+		self.OnError:Fire(Key, UpdateError)
+		if self._Callbacks.OnError then self._Callbacks.OnError(Key, UpdateError) end
 	end
 	return UpdateResult
+end
+
+function Store.QueueAction<DataType>(
+	self : StoreObject<DataType>,
+	Key : string,
+	Action : (Data : DataType) -> DataType?
+) : Result<boolean>
+	local TargetSession = self._Sessions[Key]
+	if not TargetSession then
+		return Errors.Fail(Errors.New("SessionNotFound", `No active session for key '{Key}'`, { Key = Key }))
+	end
+	return TargetSession:QueueAction(Action)
 end
 
 function Store.Save<DataType>(self : StoreObject<DataType>, Key : string) : Result<boolean>
@@ -580,12 +603,53 @@ function Store._PerformDebouncedSave<DataType>(self : StoreObject<DataType>, Key
 	end
 
 	if self._Callbacks.BeforeSave then
-		local TransformedData = self._Callbacks.BeforeSave(Key, TargetSession._Data)
-		if TransformedData == nil then
+		local DataForWire = self._Callbacks.BeforeSave(Key, Validation.DeepClone(TargetSession._Data))
+		if DataForWire == nil then
 			TargetSession:SetStatus("Active")
-			return Errors.Passed(true)
+			return Errors.Fail(Errors.New("Internal",
+				`BeforeSave cancelled save for '{Key}'`, { Key = Key }))
 		end
-		TargetSession._Data = TransformedData
+		local LiveData = TargetSession._Data
+		TargetSession._Data = DataForWire
+		local EnvelopeResult = TargetSession:BuildEnvelope()
+		TargetSession._Data = LiveData
+		if not EnvelopeResult.Passed then
+			TargetSession:SetStatus("Active")
+			return Errors.Fail((EnvelopeResult :: Types.ErrorResult).Error)
+		end
+
+		local SaveEnvelope = (EnvelopeResult :: Types.SuccessResult<Envelope<DataType>>).Value
+		local UserIds = TargetSession:GetUserIds()
+
+		if self._Middleware:HasMiddleware("save") then
+			self._Middleware:Run("save", Key, DataForWire)
+		end
+
+		if self._LockManager then
+			local CurrentLockInfo = self._LockManager:ToLockInfo(Key)
+			if CurrentLockInfo then SaveEnvelope._lock = CurrentLockInfo end
+		end
+
+		local WriteResult = self:_WriteEnvelope(Key, SaveEnvelope, UserIds)
+		self._LastWriteTime[Key] = os.clock()
+
+		if not WriteResult.Passed then
+			TargetSession:SetStatus("Active")
+			local SaveError = (WriteResult :: Types.ErrorResult).Error
+			SaveError.Key = Key
+			self.OnError:Fire(Key, SaveError)
+			if self._Callbacks.OnError then self._Callbacks.OnError(Key, SaveError) end
+			return Errors.Fail(SaveError)
+		end
+
+		TargetSession:SetStatus("Active")
+		TargetSession:MarkSaved()
+		self:_RecordAudit(Key, "Save", Validation.DeepClone(TargetSession._Data), TargetSession._Data)
+
+		self.OnSave:Fire(Key, TargetSession._Data)
+		if self._Callbacks.OnSave then self._Callbacks.OnSave(Key, TargetSession._Data) end
+
+		return Errors.Passed(true)
 	end
 
 	local EnvelopeResult = TargetSession:BuildEnvelope()
@@ -616,12 +680,13 @@ function Store._PerformDebouncedSave<DataType>(self : StoreObject<DataType>, Key
 		local SaveError = (WriteResult :: Types.ErrorResult).Error
 		SaveError.Key = Key
 		self.OnError:Fire(Key, SaveError)
+		if self._Callbacks.OnError then self._Callbacks.OnError(Key, SaveError) end
 		return Errors.Fail(SaveError)
 	end
 
 	TargetSession:SetStatus("Active")
 	TargetSession:MarkSaved()
-	self:_RecordAudit(Key, "Save", nil, TargetSession._Data)
+	self:_RecordAudit(Key, "Save", Validation.DeepClone(TargetSession._Data), TargetSession._Data)
 
 	self.OnSave:Fire(Key, TargetSession._Data)
 	if self._Callbacks.OnSave then self._Callbacks.OnSave(Key, TargetSession._Data) end
@@ -746,12 +811,14 @@ end
 function Store._StartIdleTracker<DataType>(self : StoreObject<DataType>) : ()
 	self._IdleThread = task.spawn(function()
 		local IdleFired : { [string] : boolean } = {}
+		local CheckInterval = self._Configuration.IdleCheckInterval or 60
+		local IdleTimeout = self._Configuration.IdleTimeout or DEFAULT_IDLE_THRESHOLD
 		while true do
-			task.wait(60)
+			task.wait(CheckInterval)
 			local CurrentTime = os.clock()
 			for Key, LastActive in self._LastActivity do
 				local IdleTime = CurrentTime - LastActive
-				if IdleTime >= DEFAULT_IDLE_THRESHOLD then
+				if IdleTime >= IdleTimeout then
 					if not IdleFired[Key] then
 						IdleFired[Key] = true
 						self.OnIdle:Fire(Key, IdleTime)
@@ -1042,7 +1109,20 @@ function Store.Transact<DataType>(
 	return TransactionInstance:ExecuteOptimistic(
 		function(StoreReference : unknown, Key : string, Transform : (Data : unknown) -> unknown?) : Result<unknown>
 			local TypedStore = StoreReference :: StoreObject<DataType>
-			return TypedStore:Update(Key, Transform :: any) :: any
+			local TransformReturnedNil = false
+			local WrappedTransform = function(Data : DataType) : DataType?
+				local TransformResult = (Transform :: any)(Data)
+				if TransformResult == nil then
+					TransformReturnedNil = true
+				end
+				return TransformResult
+			end
+			local UpdateResult = TypedStore:Update(Key, WrappedTransform)
+			if TransformReturnedNil then
+				return Errors.Fail(Errors.New("TransactionAborted",
+					`Transform returned nil for key '{Key}'`, { Key = Key }))
+			end
+			return UpdateResult :: any
 		end,
 		function(StoreReference : unknown, Key : string, Snapshot : unknown) : Result<boolean>
 			local TypedStore = StoreReference :: StoreObject<DataType>
@@ -1211,8 +1291,8 @@ function Store.ListKeysPage<DataType>(self : StoreObject<DataType>, Prefix : str
 	} :: PageCursor)
 end
 
-function Store.NextPage<DataType>(self : StoreObject<DataType>, Cursor : PageCursor) : Result<{ string }>
-	if Cursor._Done then return Errors.Passed({}) end
+function Store.NextPage<DataType>(self : StoreObject<DataType>, Cursor : PageCursor) : Result<{ Keys : { string }, Done : boolean }>
+	if Cursor._Done then return Errors.Passed({ Keys = {}, Done = true }) end
 	local Pages = Cursor._Pages :: DataStoreKeyPages
 
 	if Cursor._PageCount > 0 then
@@ -1231,7 +1311,7 @@ function Store.NextPage<DataType>(self : StoreObject<DataType>, Cursor : PageCur
 	end
 
 	Cursor._Done = Pages.IsFinished or Cursor._PageCount >= Cursor._MaxPages
-	return Errors.Passed(Keys)
+	return Errors.Passed({ Keys = Keys, Done = Cursor._Done :: boolean })
 end
 
 
@@ -1302,16 +1382,22 @@ function Store.Recover<DataType>(self : StoreObject<DataType>, Key : string) : R
 	self._SoftDeleted[Key] = nil
 	self:_RecordAudit(Key, "Recover", nil, Snapshot)
 
-	local LoadResult = self:Load(Key)
-	self._Telemetry:Record("Store.Recover", os.clock() - StartTime, LoadResult.Passed)
-	return LoadResult
+	local UnpackResult = SessionModule.UnpackEnvelope(Snapshot, self._Configuration.Schema)
+	if not UnpackResult.Passed then
+		self._Telemetry:Record("Store.Recover", os.clock() - StartTime, false)
+		return Errors.Fail((UnpackResult :: Types.ErrorResult).Error)
+	end
+
+	local Data = (UnpackResult :: Types.SuccessResult<{ Data : DataType, Version : number }>).Value.Data
+	self._Telemetry:Record("Store.Recover", os.clock() - StartTime, true)
+	return Errors.Passed(Data)
 end
 
 function Store.IsSoftDeleted<DataType>(self : StoreObject<DataType>, Key : string) : boolean
 	return self._SoftDeleted[Key] ~= nil
 end
 
-function Store.ListSoftDeleted<DataType>(self : StoreObject<DataType>) : { SoftDeleteInfo }
+function Store.ListSoftDeleted<DataType>(self : StoreObject<DataType>) : Result<{ SoftDeleteInfo }>
 	local Entries : { SoftDeleteInfo } = {}
 	local Retention = self._Configuration.SoftDeleteRetention or DEFAULT_SOFT_DELETE_RETENTION
 	for Key, Entry in self._SoftDeleted do
@@ -1321,7 +1407,7 @@ function Store.ListSoftDeleted<DataType>(self : StoreObject<DataType>) : { SoftD
 			ExpiresAt = if Retention > 0 then Entry.DeletedAt + Retention else nil,
 		} :: SoftDeleteInfo)
 	end
-	return Entries
+	return Errors.Passed(Entries)
 end
 
 function Store.PurgeSoftDeleted<DataType>(self : StoreObject<DataType>, Key : string) : Result<boolean>
@@ -1357,8 +1443,8 @@ function Store.PurgeSoftDeleted<DataType>(self : StoreObject<DataType>, Key : st
 	return RemoveResult
 end
 
-function Store.GetAuditLog<DataType>(self : StoreObject<DataType>, Key : string) : { AuditEntry }
-	return self._AuditLogs[Key] or {}
+function Store.GetAuditLog<DataType>(self : StoreObject<DataType>, Key : string) : Result<{ AuditEntry }>
+	return Errors.Passed(self._AuditLogs[Key] or {})
 end
 
 function Store.GetTelemetry<DataType>(self : StoreObject<DataType>) : TelemetryScope

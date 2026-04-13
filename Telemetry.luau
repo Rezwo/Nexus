@@ -106,9 +106,19 @@ function Telemetry.CreateScope(Name : string) : TelemetryScope
 	Scope._Pool = Pool
 	Scope._Name = Name
 
-	Scope.Record = function(_self : TelemetryScope, OperationName : string, Latency : number, Success : boolean, ErrorInfo : NexusError?)
-		RecordToPool(Pool, OperationName, Latency, Success, ErrorInfo)
-		RecordToPool(GlobalData, OperationName, Latency, Success, ErrorInfo)
+	Scope.Record = function(_self : TelemetryScope, OperationName : string, Latency : number, SuccessOrResult : any, ErrorInfo : NexusError?)
+		local Success : boolean
+		local ResolvedError : NexusError? = ErrorInfo
+		if typeof(SuccessOrResult) == "table" and (SuccessOrResult :: any).Passed ~= nil then
+			Success = (SuccessOrResult :: any).Passed == true
+			if not Success and (SuccessOrResult :: any).Error then
+				ResolvedError = (SuccessOrResult :: any).Error
+			end
+		else
+			Success = if SuccessOrResult then true else false
+		end
+		RecordToPool(Pool, OperationName, Latency, Success, ResolvedError)
+		RecordToPool(GlobalData, OperationName, Latency, Success, ResolvedError)
 	end
 
 	Scope.GetOperation = function(_self : TelemetryScope, OperationName : string) : OperationStats?
@@ -135,10 +145,20 @@ end
 function Telemetry.Record(
 	OperationName : string,
 	Latency : number,
-	Success : boolean,
+	SuccessOrResult : any,
 	ErrorInfo : NexusError?
 ) : ()
-	RecordToPool(GlobalData, OperationName, Latency, Success, ErrorInfo)
+	local Success : boolean
+	local ResolvedError : NexusError? = ErrorInfo
+	if typeof(SuccessOrResult) == "table" and (SuccessOrResult :: any).Passed ~= nil then
+		Success = (SuccessOrResult :: any).Passed == true
+		if not Success and (SuccessOrResult :: any).Error then
+			ResolvedError = (SuccessOrResult :: any).Error
+		end
+	else
+		Success = if SuccessOrResult then true else false
+	end
+	RecordToPool(GlobalData, OperationName, Latency, Success, ResolvedError)
 end
 
 function Telemetry.GetOperation(OperationName : string) : OperationStats?
@@ -161,7 +181,7 @@ function Telemetry.GetSummary() : {
 	TotalFailures : number,
 	OverallSuccessRate : number,
 	TrackedOperations : number,
-}
+	}
 	local TotalOps, TotalOk, TotalFail, OpCount = 0, 0, 0, 0
 	for _, Stats in GlobalData do
 		TotalOps += Stats.TotalCount

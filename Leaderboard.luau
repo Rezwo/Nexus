@@ -20,7 +20,6 @@ export type LeaderboardEntry = {
 export type LeaderboardConfiguration = {
 	Name : string,
 	Scope : string?,
-
 	Ascending : boolean?,
 	MaxRetries : number?,
 }
@@ -136,7 +135,7 @@ function Leaderboard.GetTop(
 	local StartTime = os.clock()
 	local PagesResult = Retry.WrapPcall("DataStoreError", function()
 		return self._OrderedStore:GetSortedAsync(
-			self._SortDirection :: any, PageSize, MinValue, MaxValue
+			self._SortDirection == Enum.SortDirection.Ascending, PageSize, MinValue, MaxValue
 		)
 	end, {
 		MaxRetries = self._Configuration.MaxRetries or 3,
@@ -196,7 +195,7 @@ function Leaderboard.GetRange(
 	local StartTime = os.clock()
 	local PagesResult = Retry.WrapPcall("DataStoreError", function()
 		return self._OrderedStore:GetSortedAsync(
-			self._SortDirection :: any, PageSize, MinValue, MaxValue
+			self._SortDirection == Enum.SortDirection.Ascending, PageSize, MinValue, MaxValue
 		)
 	end, {
 		MaxRetries = self._Configuration.MaxRetries or 3,
@@ -232,7 +231,7 @@ function Leaderboard.GetRank(
 
 	local StartTime = os.clock()
 	local PagesResult = Retry.WrapPcall("DataStoreError", function()
-		return self._OrderedStore:GetSortedAsync(self._SortDirection :: any, 100)
+		return self._OrderedStore:GetSortedAsync(self._SortDirection == Enum.SortDirection.Ascending, 100)
 	end, {
 		MaxRetries = self._Configuration.MaxRetries or 3,
 		BudgetType = "GetSortedAsync",

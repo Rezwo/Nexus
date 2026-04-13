@@ -24,15 +24,12 @@ function Signal.Connect<T...>(self : Signal<T...>, Callback : (T...) -> ()) : Co
 	local Entry : CallbackEntry = { Callback = Callback :: any, Once = false }
 	table.insert((self :: any)._Listeners, Entry)
 
-
 	local SignalReference = self
 
 	local ConnectionObject = {} :: any
 	ConnectionObject.Connected = true
 	ConnectionObject.Disconnect = function(ConnectionSelf : Connection)
-		if not ConnectionObject.Connected then
-			return
-		end
+		if not ConnectionObject.Connected then return end
 		ConnectionObject.Connected = false
 		local Listeners = (SignalReference :: any)._Listeners :: { CallbackEntry }
 		local Index = table.find(Listeners, Entry)
@@ -52,9 +49,7 @@ function Signal.Once<T...>(self : Signal<T...>, Callback : (T...) -> ()) : Conne
 	local ConnectionObject = {} :: any
 	ConnectionObject.Connected = true
 	ConnectionObject.Disconnect = function(ConnectionSelf : Connection)
-		if not ConnectionObject.Connected then
-			return
-		end
+		if not ConnectionObject.Connected then return end
 		ConnectionObject.Connected = false
 		local Listeners = (SignalReference :: any)._Listeners :: { CallbackEntry }
 		local Index = table.find(Listeners, Entry)
@@ -67,15 +62,18 @@ end
 
 function Signal.Fire<T...>(self : Signal<T...>, ... : T...)
 	local Listeners = (self :: any)._Listeners :: { CallbackEntry }
+	local Snapshot = table.clone(Listeners)
 	local Index = 1
-	while Index <= #Listeners do
-		local Entry = Listeners[Index]
+	while Index <= #Snapshot do
+		local Entry = Snapshot[Index]
 		task.spawn(Entry.Callback, ...)
 		if Entry.Once then
-			table.remove(Listeners, Index)
-		else
-			Index += 1
+			local RealIndex = table.find(Listeners, Entry)
+			if RealIndex then
+				table.remove(Listeners, RealIndex)
+			end
 		end
+		Index += 1
 	end
 
 	local WaitingThreads = (self :: any)._Waiting :: { thread }
