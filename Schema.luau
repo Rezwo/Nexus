@@ -77,9 +77,11 @@ function Schema.Migrate<DataType>(
 
 	if Migrations then
 		local SortedMigrations : { MigrationStep } = table.clone(Migrations)
+
 		table.sort(SortedMigrations, function(StepA : MigrationStep, StepB : MigrationStep)
 			return StepA.Version < StepB.Version
 		end)
+
 		for _, Step in SortedMigrations do
 			if Step.Version > CurrentVersion and Step.Version <= TargetVersion then
 				local MigrationSuccess, MigrationResult = pcall(Step.Up, CurrentData)
