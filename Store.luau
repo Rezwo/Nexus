@@ -136,6 +136,7 @@ export type StoreObject<DataType> = {
 	_WaitForWriteCooldown : (self : StoreObject<DataType>, Key : string) -> (),
 	_WriteEnvelope : (self : StoreObject<DataType>, Key : string, WriteEnvelope : Envelope<DataType>, UserIds : { number }?) -> Result<boolean>,
 	_WriteEnvelopeInner : (self : StoreObject<DataType>, Key : string, WriteEnvelope : Envelope<DataType>, UserIds : { number }?) -> Result<boolean>,
+	_PerformDebouncedSave : (self : StoreObject<DataType>, Key : string) -> Result<boolean>,
 	_RecordAudit : (self : StoreObject<DataType>, Key : string, Operation : string, Before : unknown?, After : unknown?) -> (),
 	_DebugLog : (self : StoreObject<DataType>, Operation : string, Key : string?, Elapsed : number?) -> (),
 	_TouchActivity : (self : StoreObject<DataType>, Key : string) -> (),
@@ -443,6 +444,11 @@ function Store.Peek<DataType>(self : StoreObject<DataType>, Key : string) : Resu
 
 	if RawData ~= nil and typeof(RawData) == "table" then
 		local ManifestTable = RawData :: any
+		if ManifestTable._deleted == true then
+			local DeletedError = Errors.New("KeyNotFound", `Key '{Key}' has been soft-deleted`, { Key = Key })
+			self._Telemetry:Record("Store.Peek", os.clock() - StartTime, false, DeletedError)
+			return Errors.Fail(DeletedError)
+		end
 		local ShardCount = ManifestTable._s
 		if typeof(ShardCount) == "number" and ShardCount > 0 then
 			local ShardResult = Shard.ReadShards(self._DataStore, Key, ShardCount, self._Configuration.MaxRetries)
@@ -523,7 +529,7 @@ function Store.Update<DataType>(
 			self.OnDirty:Fire(Key)
 		end
 		if self._Configuration.AuditLog then
-			self:_RecordAudit(Key, "Update", Before, TargetSession._Data)
+			self:_RecordAudit(Key, "Update", Before, Validation.DeepClone(TargetSession._Data))
 		end
 	end
 	return UpdateResult
@@ -539,10 +545,47 @@ function Store.Save<DataType>(self : StoreObject<DataType>, Key : string) : Resu
 		return Errors.Passed(true)
 	end
 
+	local DebounceInterval = self._Configuration.DebounceInterval
+	if DebounceInterval and DebounceInterval > 0 and not self._ShuttingDown then
+		local ExistingTimer = self._DebounceTimers[Key]
+		if ExistingTimer then
+			task.cancel(ExistingTimer)
+		end
+		self._DebounceTimers[Key] = task.delay(DebounceInterval, function()
+			self._DebounceTimers[Key] = nil
+			if self._Sessions[Key] and self._Sessions[Key]:IsDirty() then
+				self:_PerformDebouncedSave(Key)
+			end
+		end)
+		return Errors.Passed(true)
+	end
+
+	return self:_PerformDebouncedSave(Key)
+end
+
+function Store._PerformDebouncedSave<DataType>(self : StoreObject<DataType>, Key : string) : Result<boolean>
+	local TargetSession = self._Sessions[Key]
+	if not TargetSession then
+		return Errors.Fail(Errors.New("SessionNotFound", `No active session for key '{Key}'`, { Key = Key }))
+	end
+
+	if TargetSession._Status ~= "Active" then
+		return Errors.Passed(true)
+	end
+
 	TargetSession:SetStatus("Saving")
 
 	if not self._ShuttingDown then
 		self:_WaitForWriteCooldown(Key)
+	end
+
+	if self._Callbacks.BeforeSave then
+		local TransformedData = self._Callbacks.BeforeSave(Key, TargetSession._Data)
+		if TransformedData == nil then
+			TargetSession:SetStatus("Active")
+			return Errors.Passed(true)
+		end
+		TargetSession._Data = TransformedData
 	end
 
 	local EnvelopeResult = TargetSession:BuildEnvelope()
@@ -553,14 +596,6 @@ function Store.Save<DataType>(self : StoreObject<DataType>, Key : string) : Resu
 
 	local SaveEnvelope = (EnvelopeResult :: Types.SuccessResult<Envelope<DataType>>).Value
 	local UserIds = TargetSession:GetUserIds()
-
-	if self._Callbacks.BeforeSave then
-		local TransformedData = self._Callbacks.BeforeSave(Key, TargetSession._Data)
-		if TransformedData == nil then
-			TargetSession:SetStatus("Active")
-			return Errors.Passed(true)
-		end
-	end
 
 	if self._Middleware:HasMiddleware("save") then
 		self._Middleware:Run("save", Key, TargetSession._Data)
@@ -710,13 +745,19 @@ end
 
 function Store._StartIdleTracker<DataType>(self : StoreObject<DataType>) : ()
 	self._IdleThread = task.spawn(function()
+		local IdleFired : { [string] : boolean } = {}
 		while true do
 			task.wait(60)
 			local CurrentTime = os.clock()
 			for Key, LastActive in self._LastActivity do
 				local IdleTime = CurrentTime - LastActive
 				if IdleTime >= DEFAULT_IDLE_THRESHOLD then
-					self.OnIdle:Fire(Key, IdleTime)
+					if not IdleFired[Key] then
+						IdleFired[Key] = true
+						self.OnIdle:Fire(Key, IdleTime)
+					end
+				else
+					IdleFired[Key] = nil
 				end
 			end
 		end
@@ -1164,7 +1205,7 @@ function Store.ListKeysPage<DataType>(self : StoreObject<DataType>, Prefix : str
 	local Pages = (ListResult :: Types.SuccessResult<DataStoreKeyPages>).Value
 	return Errors.Passed({
 		_Pages = Pages,
-		_Done = Pages.IsFinished,
+		_Done = false,
 		_PageCount = 0,
 		_MaxPages = 1000,
 	} :: PageCursor)
