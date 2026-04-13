@@ -51,7 +51,10 @@ Store.__index = Store
 local WRITE_COOLDOWN = 6
 local DEFAULT_IDLE_THRESHOLD = 600
 local DEFAULT_AUDIT_LOG_SIZE = 50
+local DEFAULT_AUDIT_SHARD_THRESHOLD = 3_500_000
 local DEFAULT_SOFT_DELETE_RETENTION = 2592000
+
+local HttpService = game:GetService("HttpService")
 
 export type ListVersionsOptions = {
 	SortDirection : Enum.SortDirection?,
@@ -82,6 +85,8 @@ export type StoreObject<DataType> = {
 	_ShardCounts : { [string] : number },
 	_ShuttingDown : boolean,
 	_AuditLogs : { [string] : { AuditEntry } },
+	_AuditShardCounts : { [string] : number },
+	_AuditDirty : { [string] : boolean },
 	_SoftDeleted : { [string] : { DeletedAt : number, EnvelopeSnapshot : unknown } },
 	_DebounceTimers : { [string] : thread },
 	_LastActivity : { [string] : number },
@@ -121,6 +126,7 @@ export type StoreObject<DataType> = {
 	ListSoftDeleted : (self : StoreObject<DataType>) -> Result<{ SoftDeleteInfo }>,
 	PurgeSoftDeleted : (self : StoreObject<DataType>, Key : string) -> Result<boolean>,
 	GetAuditLog : (self : StoreObject<DataType>, Key : string) -> Result<{ AuditEntry }>,
+	GetAuditLogRemote : (self : StoreObject<DataType>, Key : string) -> Result<{ AuditEntry }>,
 	GetTelemetry : (self : StoreObject<DataType>) -> TelemetryScope,
 	Use : (self : StoreObject<DataType>, Phase : MiddlewarePhase, Handler : MiddlewareFn) -> (),
 	SetCallbacks : (self : StoreObject<DataType>, Callbacks : StoreCallbacks<DataType>) -> (),
@@ -141,6 +147,7 @@ export type StoreObject<DataType> = {
 	_PerformDebouncedSave : (self : StoreObject<DataType>, Key : string) -> Result<boolean>,
 	_CommitParticipantCAS : (self : StoreObject<DataType>, Key : string, Transform : (Data : DataType) -> DataType?, ExpectedTxv : number, UserIds : { number }?) -> Result<boolean>,
 	_RecordAudit : (self : StoreObject<DataType>, Key : string, Operation : string, Before : unknown?, After : unknown?) -> (),
+	_FlushAuditLog : (self : StoreObject<DataType>, Key : string) -> (),
 	_DebugLog : (self : StoreObject<DataType>, Operation : string, Key : string?, Elapsed : number?) -> (),
 	_TouchActivity : (self : StoreObject<DataType>, Key : string) -> (),
 }
@@ -187,6 +194,8 @@ function Store.New<DataType>(Configuration : StoreConfiguration<DataType>) : Sto
 		SoftDeleteRetention = Configuration.SoftDeleteRetention or DEFAULT_SOFT_DELETE_RETENTION,
 		AuditLog = Configuration.AuditLog or false,
 		AuditLogSize = Configuration.AuditLogSize or DEFAULT_AUDIT_LOG_SIZE,
+		AuditPersistence = Configuration.AuditPersistence or false,
+		AuditShardThreshold = Configuration.AuditShardThreshold or DEFAULT_AUDIT_SHARD_THRESHOLD,
 		Debug = Configuration.Debug or false,
 		IdleTimeout = Configuration.IdleTimeout or DEFAULT_IDLE_THRESHOLD,
 		IdleCheckInterval = Configuration.IdleCheckInterval
@@ -214,6 +223,8 @@ function Store.New<DataType>(Configuration : StoreConfiguration<DataType>) : Sto
 	self._ShardCounts = {}
 	self._ShuttingDown = false
 	self._AuditLogs = {}
+	self._AuditShardCounts = {}
+	self._AuditDirty = {}
 	self._SoftDeleted = {}
 	self._DebounceTimers = {}
 	self._LastActivity = {}
@@ -279,6 +290,7 @@ function Store._RecordAudit<DataType>(self : StoreObject<DataType>, Key : string
 		Source = game.JobId ~= "" and game.JobId or "Studio",
 		SessionId = self._Configuration.Name .. ":" .. Key,
 	} :: AuditEntry)
+	self._AuditDirty[Key] = true
 end
 
 function Store._TouchActivity<DataType>(self : StoreObject<DataType>, Key : string) : ()
@@ -658,6 +670,7 @@ function Store._PerformDebouncedSave<DataType>(self : StoreObject<DataType>, Key
 		TargetSession:SetStatus("Active")
 		TargetSession:MarkSaved()
 		self:_RecordAudit(Key, "Save", Validation.DeepClone(TargetSession._Data), TargetSession._Data)
+		self:_FlushAuditLog(Key)
 
 		self.OnSave:Fire(Key, TargetSession._Data)
 		if self._Callbacks.OnSave then self._Callbacks.OnSave(Key, TargetSession._Data) end
@@ -700,6 +713,7 @@ function Store._PerformDebouncedSave<DataType>(self : StoreObject<DataType>, Key
 	TargetSession:SetStatus("Active")
 	TargetSession:MarkSaved()
 	self:_RecordAudit(Key, "Save", Validation.DeepClone(TargetSession._Data), TargetSession._Data)
+	self:_FlushAuditLog(Key)
 
 	self.OnSave:Fire(Key, TargetSession._Data)
 	if self._Callbacks.OnSave then self._Callbacks.OnSave(Key, TargetSession._Data) end
@@ -731,12 +745,16 @@ function Store.Close<DataType>(self : StoreObject<DataType>, Key : string) : Res
 	end
 
 	self:_RecordAudit(Key, "Close", nil, nil)
+	self:_FlushAuditLog(Key)
 	TargetSession:Close()
 	self._Sessions[Key] = nil
 	self._LastWriteTime[Key] = nil
 	self._ShardCounts[Key] = nil
 	self._LastActivity[Key] = nil
 	self._LastKnownTxv[Key] = nil
+	self._AuditLogs[Key] = nil
+	self._AuditShardCounts[Key] = nil
+	self._AuditDirty[Key] = nil
 
 	self.OnRelease:Fire(Key)
 	if self._Callbacks.OnRelease then self._Callbacks.OnRelease(Key) end
@@ -773,6 +791,7 @@ function Store._PerformCloseSave<DataType>(
 		warn(`[Nexus] Close-save failed for '{Key}': {(WriteResult :: Types.ErrorResult).Error.Message}`)
 	else
 		TargetSession:MarkSaved()
+		self:_FlushAuditLog(Key)
 	end
 end
 
@@ -1116,33 +1135,29 @@ function Store.SaveOptimistic<DataType>(self : StoreObject<DataType>, Key : stri
 end
 
 
--- Returns:
---   Errors.Passed(true)     → committed
---   Errors.Passed(false)    → CAS conflict (retry the transaction, not an error)
---   Errors.Fail(...)        → hard DataStore error
 function Store._CommitParticipantCAS<DataType>(
-	self                     : StoreObject<DataType>,
-	Key                      : string,
-	Transform                : (Data : DataType) -> DataType?,
+	self : StoreObject<DataType>,
+	Key : string,
+	Transform : (Data : DataType) -> DataType?,
 	ExpectedTransactionVersion : number,
-	UserIds                  : { number }?
+	UserIds : { number }?
 ) : Result<boolean>
-	local SchemaDefinition    = self._Configuration.Schema
-	local ShouldCompress      = self._Configuration.Compress or false
+	local SchemaDefinition = self._Configuration.Schema
+	local ShouldCompress = self._Configuration.Compress or false
 	local CompressionThreshold = self._Configuration.CompressionThreshold or 4096
-	local CompressionLevel    = self._Configuration.CompressionLevel or 3
-	local CurrentLockManager  = self._LockManager
+	local CompressionLevel = self._Configuration.CompressionLevel or 3
+	local CurrentLockManager = self._LockManager
 
-	local WasConflict        = false
+	local WasConflict = false
 	local TransformReturnedNil = false
-	local ValidationFailure  : string? = nil
+	local ValidationFailure : string? = nil
 
 	local WriteResult = Retry.WrapPcall("DataStoreError", function()
 		self._DataStore:UpdateAsync(Key, function(CurrentRemote : unknown)
-			WasConflict        = false
+			WasConflict = false
 			TransformReturnedNil = false
 
-			-- ── CAS check ──────────────────────────────────────────────────
+
 			local RemoteTransactionVersion = 0
 			if typeof(CurrentRemote) == "table" then
 				local RemoteTable = CurrentRemote :: any
@@ -1152,13 +1167,12 @@ function Store._CommitParticipantCAS<DataType>(
 			end
 			if RemoteTransactionVersion ~= ExpectedTransactionVersion then
 				WasConflict = true
-				return nil  -- abort without writing; DataStore treats this as success
+				return nil
 			end
 
-			-- ── Unpack + transform ─────────────────────────────────────────
 			local UnpackResult = SessionModule.UnpackEnvelope(CurrentRemote, SchemaDefinition)
 			if not UnpackResult.Passed then
-				WasConflict = true   -- treat corrupt remote as a conflict; caller will retry
+				WasConflict = true
 				return nil
 			end
 			local RemoteData = (UnpackResult :: Types.SuccessResult<{ Data : DataType, Version : number }>).Value.Data
@@ -1169,7 +1183,7 @@ function Store._CommitParticipantCAS<DataType>(
 				return nil
 			end
 
-			-- ── Optional schema validation ─────────────────────────────────
+
 			if SchemaDefinition.Validate then
 				local IsValid, ValidationReason = SchemaDefinition.Validate(TransformedData)
 				if not IsValid then
@@ -1178,7 +1192,7 @@ function Store._CommitParticipantCAS<DataType>(
 				end
 			end
 
-			-- ── Build new envelope ─────────────────────────────────────────
+
 			local PayloadData : DataType | string = TransformedData
 			local IsCompressed = false
 			if ShouldCompress then
@@ -1193,10 +1207,10 @@ function Store._CommitParticipantCAS<DataType>(
 			end
 
 			local CommitEnvelope : Types.Envelope<DataType> = {
-				_v   = SchemaDefinition.Version,
+				_v = SchemaDefinition.Version,
 				_txv = RemoteTransactionVersion + 1,
-				_c   = if IsCompressed then true else nil,
-				_d   = PayloadData,
+				_c = if IsCompressed then true else nil,
+				_d = PayloadData,
 			}
 			if CurrentLockManager then
 				local CurrentLockInfo = CurrentLockManager:ToLockInfo(Key)
@@ -1220,30 +1234,28 @@ function Store._CommitParticipantCAS<DataType>(
 		return Errors.Fail(Errors.New("TransactionAborted",
 			`Transform returned nil for key '{Key}'`, { Key = Key }))
 	end
-	-- WasConflict = false means "committed"; true means "retry needed"
+
 	return Errors.Passed(not WasConflict)
 end
 
 function Store.Transact<DataType>(
-	self          : StoreObject<DataType>,
-	Participants  : { { Key : string, Transform : (Data : DataType) -> DataType? } },
+	self : StoreObject<DataType>,
+	Participants : { { Key : string, Transform : (Data : DataType) -> DataType? } },
 	Configuration : TransactionConfiguration?
 ) : TransactionResult
 	local MaxRetryCount = (Configuration and Configuration.MaxRetries) or 3
-	local Results       : { [string] : Result<boolean> } = {}
+	local Results : { [string] : Result<boolean> } = {}
 
 	for Attempt = 1, MaxRetryCount do
 
-		-- ── Snapshot current _txv and data for each participant ────────────
-		-- We re-read at the start of every retry so we're working from
-		-- the freshest remote state, not stale in-memory data.
+
 		local ParticipantSnapshots : { [string] : { TransactionVersion : number, Data : DataType } } = {}
 		for _, ParticipantEntry in Participants do
 			local TargetSession = self._Sessions[ParticipantEntry.Key]
 			if not TargetSession then
 				return {
 					Passed = false,
-					Error  = Errors.New("SessionNotFound",
+					Error = Errors.New("SessionNotFound",
 						`No active session for '{ParticipantEntry.Key}'`, { Key = ParticipantEntry.Key }),
 					Results = {},
 				}
@@ -1251,18 +1263,17 @@ function Store.Transact<DataType>(
 			local RemoteTransactionVersion = self._LastKnownTxv[ParticipantEntry.Key] or 0
 			ParticipantSnapshots[ParticipantEntry.Key] = {
 				TransactionVersion = RemoteTransactionVersion,
-				Data               = Validation.DeepClone(TargetSession._Data),
+				Data = Validation.DeepClone(TargetSession._Data),
 			}
 		end
 
-		-- ── Attempt CAS commit for each participant ────────────────────────
-		local CommittedKeys    : { string } = {}
+		local CommittedKeys : { string } = {}
 		local ConflictDetected = false
-		local HardError        : NexusError? = nil
+		local HardError : NexusError? = nil
 
 		for _, ParticipantEntry in Participants do
 			local ParticipantSnapshot = ParticipantSnapshots[ParticipantEntry.Key]
-			local ParticipantUserIds  = self._Sessions[ParticipantEntry.Key]:GetUserIds()
+			local ParticipantUserIds = self._Sessions[ParticipantEntry.Key]:GetUserIds()
 
 			local CommitResult = self:_CommitParticipantCAS(
 				ParticipantEntry.Key,
@@ -1272,11 +1283,11 @@ function Store.Transact<DataType>(
 
 			if not CommitResult.Passed then
 				HardError = (CommitResult :: Types.ErrorResult).Error
-				-- Saga: compensate already-committed participants
+
 				for _, CommittedKey in CommittedKeys do
 					local RollbackSession = self._Sessions[CommittedKey]
 					if RollbackSession then
-						RollbackSession._Data  = ParticipantSnapshots[CommittedKey].Data
+						RollbackSession._Data = ParticipantSnapshots[CommittedKey].Data
 						RollbackSession._Dirty = true
 						self:_PerformDebouncedSave(CommittedKey)
 					end
@@ -1286,13 +1297,11 @@ function Store.Transact<DataType>(
 
 			local DidCommit = (CommitResult :: Types.SuccessResult<boolean>).Value
 			if not DidCommit then
-				-- CAS conflict on this key — another server wrote concurrently.
-				-- Roll back what we've committed this attempt and retry.
 				ConflictDetected = true
 				for _, CommittedKey in CommittedKeys do
 					local RollbackSession = self._Sessions[CommittedKey]
 					if RollbackSession then
-						RollbackSession._Data  = ParticipantSnapshots[CommittedKey].Data
+						RollbackSession._Data = ParticipantSnapshots[CommittedKey].Data
 						RollbackSession._Dirty = true
 						self:_PerformDebouncedSave(CommittedKey)
 					end
@@ -1306,9 +1315,7 @@ function Store.Transact<DataType>(
 
 		if ConflictDetected then
 			if Attempt < MaxRetryCount then
-				-- Exponential backoff before retry; also re-read remote transaction version.
 				task.wait(0.1 * (2 ^ (Attempt - 1)) + math.random() * 0.1)
-				-- Re-sync _txv for conflicted keys from DataStore before next attempt.
 				for _, ParticipantEntry in Participants do
 					local PeekResult = Retry.WrapPcall("DataStoreError", function()
 						return self._DataStore:GetAsync(ParticipantEntry.Key)
@@ -1325,15 +1332,12 @@ function Store.Transact<DataType>(
 			continue
 		end
 
-		-- ── All committed. Sync in-memory sessions. ────────────────────────
 		for _, ParticipantEntry in Participants do
 			local TargetSession = self._Sessions[ParticipantEntry.Key]
 			if TargetSession then
-				-- The transform has been applied remotely; apply it locally too
-				-- so in-memory state stays consistent without a full reload.
 				local TransformedData = ParticipantEntry.Transform(Validation.DeepClone(TargetSession._Data))
 				if TransformedData ~= nil then
-					TargetSession._Data  = TransformedData
+					TargetSession._Data = TransformedData
 					TargetSession._Dirty = false
 				end
 			end
@@ -1343,8 +1347,8 @@ function Store.Transact<DataType>(
 	end
 
 	return {
-		Passed  = false,
-		Error   = Errors.New("TransactionConflict",
+		Passed = false,
+		Error = Errors.New("TransactionConflict",
 			`Transaction failed after {MaxRetryCount} CAS retries`),
 		Results = Results,
 	}
@@ -1648,6 +1652,15 @@ function Store.PurgeSoftDeleted<DataType>(self : StoreObject<DataType>, Key : st
 	if RemoveResult.Passed then
 		self._SoftDeleted[Key] = nil
 		self._AuditLogs[Key] = nil
+		self._AuditDirty[Key] = nil
+
+		local AuditKey = Key .. "_audit"
+		local AuditShardCount = self._AuditShardCounts[Key] or 0
+		if AuditShardCount > 0 then
+			Shard.DeleteAllShards(self._DataStore, AuditKey, AuditShardCount)
+		end
+		pcall(function() self._DataStore:RemoveAsync(AuditKey) end)
+		self._AuditShardCounts[Key] = nil
 		self:_RecordAudit(Key, "PurgeSoftDeleted", nil, nil)
 	end
 
@@ -1656,6 +1669,196 @@ end
 
 function Store.GetAuditLog<DataType>(self : StoreObject<DataType>, Key : string) : Result<{ AuditEntry }>
 	return Errors.Passed(self._AuditLogs[Key] or {})
+end
+
+function Store._FlushAuditLog<DataType>(self : StoreObject<DataType>, Key : string) : ()
+	if not self._Configuration.AuditPersistence then return end
+	if not self._AuditDirty[Key] then return end
+
+	local LocalEntries = self._AuditLogs[Key]
+	if not LocalEntries or #LocalEntries == 0 then
+		self._AuditDirty[Key] = false
+		return
+	end
+
+	local AuditKey = Key .. "_audit"
+	local MaxSize = self._Configuration.AuditLogSize or DEFAULT_AUDIT_LOG_SIZE
+	local ShardThreshold = self._Configuration.AuditShardThreshold or DEFAULT_AUDIT_SHARD_THRESHOLD
+	local MaxRetries = self._Configuration.MaxRetries or 5
+
+
+	local ExistingEntries : { AuditEntry } = {}
+	local OldAuditShardCount = self._AuditShardCounts[Key] or 0
+
+	local ReadSuccess, ReadResult = pcall(function()
+		return self._DataStore:GetAsync(AuditKey)
+	end)
+
+	if ReadSuccess and ReadResult ~= nil and typeof(ReadResult) == "table" then
+		local RemoteTable = ReadResult :: any
+		local RemoteShardCount = RemoteTable._s
+		if typeof(RemoteShardCount) == "number" and RemoteShardCount > 0 then
+
+			OldAuditShardCount = RemoteShardCount
+			local ShardReadResult = Shard.ReadShards(self._DataStore, AuditKey, RemoteShardCount, MaxRetries)
+			if ShardReadResult.Passed then
+				local CompressedPayload = (ShardReadResult :: Types.SuccessResult<string>).Value
+				local DecompressResult = Compression.DecompressToString(CompressedPayload)
+				if DecompressResult.Passed then
+					local JsonString = (DecompressResult :: Types.SuccessResult<string>).Value
+					local ParseSuccess, ParsedEntries = pcall(HttpService.JSONDecode, HttpService, JsonString)
+					if ParseSuccess and typeof(ParsedEntries) == "table" then
+						ExistingEntries = ParsedEntries :: any
+					end
+				end
+			end
+		elseif RemoteTable._c == true and typeof(RemoteTable._d) == "string" then
+
+			local DecompressResult = Compression.DecompressToString(RemoteTable._d :: string)
+			if DecompressResult.Passed then
+				local JsonString = (DecompressResult :: Types.SuccessResult<string>).Value
+				local ParseSuccess, ParsedEntries = pcall(HttpService.JSONDecode, HttpService, JsonString)
+				if ParseSuccess and typeof(ParsedEntries) == "table" then
+					ExistingEntries = ParsedEntries :: any
+				end
+			end
+		end
+	end
+
+
+	local MergedEntries : { AuditEntry } = {}
+
+
+	for _, Entry in ExistingEntries do
+		table.insert(MergedEntries, Entry)
+	end
+
+
+	for _, Entry in LocalEntries do
+		table.insert(MergedEntries, Entry)
+	end
+
+
+	while #MergedEntries > MaxSize do
+		table.remove(MergedEntries, 1)
+	end
+
+
+	local EncodeSuccess, JsonPayload = pcall(HttpService.JSONEncode, HttpService, MergedEntries)
+	if not EncodeSuccess then
+		warn(`[Nexus] _FlushAuditLog: JSON encode failed for '{AuditKey}': {JsonPayload}`)
+		return
+	end
+
+	local CompressResult = Compression.CompressString(JsonPayload :: string)
+	if not CompressResult.Passed then
+		warn(`[Nexus] _FlushAuditLog: compress failed for '{AuditKey}'`)
+		return
+	end
+
+	local CompressedPayload = (CompressResult :: Types.SuccessResult<string>).Value
+
+
+	local NeedsSharding = #CompressedPayload > ShardThreshold and ShardThreshold > 0
+
+	if NeedsSharding then
+		local Chunks = Shard.Split(CompressedPayload, ShardThreshold)
+		local NewShardCount = #Chunks
+
+		local ShardWriteResult = Shard.WriteShards(self._DataStore, AuditKey, Chunks, MaxRetries)
+		if not ShardWriteResult.Passed then
+			warn(`[Nexus] _FlushAuditLog: shard write failed for '{AuditKey}'`)
+			return
+		end
+
+
+		pcall(function()
+			self._DataStore:SetAsync(AuditKey, { _s = NewShardCount })
+		end)
+
+
+		if OldAuditShardCount > NewShardCount then
+			Shard.CleanupOrphanedShards(self._DataStore, AuditKey, OldAuditShardCount, NewShardCount)
+		end
+
+		self._AuditShardCounts[Key] = NewShardCount
+		self:_DebugLog("AuditFlush.Sharded", Key)
+	else
+
+		pcall(function()
+			self._DataStore:SetAsync(AuditKey, {
+				_c = true,
+				_d = CompressedPayload,
+			})
+		end)
+
+
+		if OldAuditShardCount > 0 then
+			Shard.DeleteAllShards(self._DataStore, AuditKey, OldAuditShardCount)
+		end
+
+		self._AuditShardCounts[Key] = 0
+		self:_DebugLog("AuditFlush.Direct", Key)
+	end
+
+	self._AuditDirty[Key] = false
+end
+
+function Store.GetAuditLogRemote<DataType>(self : StoreObject<DataType>, Key : string) : Result<{ AuditEntry }>
+	local AuditKey = Key .. "_audit"
+
+	local FetchResult = Retry.WrapPcall("DataStoreError", function()
+		return self._DataStore:GetAsync(AuditKey)
+	end, { MaxRetries = self._Configuration.MaxRetries, BudgetType = "GetAsync" } :: any)
+
+	if not FetchResult.Passed then
+		return Errors.Fail((FetchResult :: Types.ErrorResult).Error)
+	end
+
+	local RawData = (FetchResult :: Types.SuccessResult<unknown>).Value
+	if RawData == nil then
+		return Errors.Passed({})
+	end
+
+	if typeof(RawData) ~= "table" then
+		return Errors.Fail(Errors.New("Internal",
+			`Audit log for '{Key}' has unexpected type '{typeof(RawData)}'`, { Key = Key }))
+	end
+
+	local RemoteTable = RawData :: any
+	local CompressedPayload : string? = nil
+
+
+	local RemoteShardCount = RemoteTable._s
+	if typeof(RemoteShardCount) == "number" and RemoteShardCount > 0 then
+		local ShardReadResult = Shard.ReadShards(
+			self._DataStore, AuditKey, RemoteShardCount, self._Configuration.MaxRetries)
+		if not ShardReadResult.Passed then
+			return Errors.Fail((ShardReadResult :: Types.ErrorResult).Error)
+		end
+		CompressedPayload = (ShardReadResult :: Types.SuccessResult<string>).Value
+		self._AuditShardCounts[Key] = RemoteShardCount
+	elseif RemoteTable._c == true and typeof(RemoteTable._d) == "string" then
+		CompressedPayload = RemoteTable._d :: string
+		self._AuditShardCounts[Key] = 0
+	else
+		return Errors.Passed({})
+	end
+
+
+	local DecompressResult = Compression.DecompressToString(CompressedPayload :: string)
+	if not DecompressResult.Passed then
+		return Errors.Fail((DecompressResult :: Types.ErrorResult).Error)
+	end
+
+	local JsonString = (DecompressResult :: Types.SuccessResult<string>).Value
+	local ParseSuccess, ParsedEntries = pcall(HttpService.JSONDecode, HttpService, JsonString)
+	if not ParseSuccess then
+		return Errors.Fail(Errors.New("Internal",
+			`Failed to parse audit log JSON for '{Key}': {ParsedEntries}`, { Key = Key }))
+	end
+
+	return Errors.Passed(ParsedEntries :: { AuditEntry })
 end
 
 function Store.GetTelemetry<DataType>(self : StoreObject<DataType>) : TelemetryScope
@@ -1710,7 +1913,17 @@ function Store.Remove<DataType>(self : StoreObject<DataType>, Key : string) : Re
 	end
 	self._ShardCounts[Key] = nil
 	self._AuditLogs[Key] = nil
+	self._AuditDirty[Key] = nil
 	self._SoftDeleted[Key] = nil
+
+
+	local AuditKey = Key .. "_audit"
+	local AuditShardCount = self._AuditShardCounts[Key] or 0
+	if AuditShardCount > 0 then
+		Shard.DeleteAllShards(self._DataStore, AuditKey, AuditShardCount)
+	end
+	pcall(function() self._DataStore:RemoveAsync(AuditKey) end)
+	self._AuditShardCounts[Key] = nil
 
 	return Retry.WrapPcall("DataStoreError", function()
 		self._DataStore:RemoveAsync(Key)

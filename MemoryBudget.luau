@@ -1,30 +1,26 @@
 --!strict
 
 local Errors = require(script.Parent.Errors)
-local Types  = require(script.Parent.Types)
+local Types = require(script.Parent.Types)
 
 type Result<Value> = Types.Result<Value>
 
--- ── Per-resource state ────────────────────────────────────────────────────────
--- Keyed by an arbitrary discriminator string (typically the Store name).
--- A failure in one resource cannot trigger backoff in another.
-
-local DRAIN_INTERVAL    = 0.5
+local DRAIN_INTERVAL = 0.5
 local MAXIMUM_QUEUE_WAIT = 30
-local FAILURE_WINDOW    = 10
+local FAILURE_WINDOW = 10
 local FAILURE_THRESHOLD = 5
-local BACKOFF_DURATION  = 5
+local BACKOFF_DURATION = 5
 
 type QueuedOperation = {
-	Thread     : thread,
+	Thread : thread,
 	EnqueuedAt : number,
 }
 
 type ResourceBucket = {
-	Failures     : { number },
+	Failures : { number },
 	BackoffUntil : number,
-	Queues       : { [string] : { QueuedOperation } },
-	Draining     : boolean,
+	Queues : { [string] : { QueuedOperation } },
+	Draining : boolean,
 }
 
 local Buckets : { [string] : ResourceBucket } = {}
@@ -33,18 +29,18 @@ local function GetBucket(Resource : string) : ResourceBucket
 	local ExistingBucket = Buckets[Resource]
 	if ExistingBucket then return ExistingBucket end
 	local NewBucket : ResourceBucket = {
-		Failures     = {},
+		Failures = {},
 		BackoffUntil = 0,
-		Queues       = {},
-		Draining     = false,
+		Queues = {},
+		Draining = false,
 	}
 	Buckets[Resource] = NewBucket
 	return NewBucket
 end
 
 local function PruneFailures(Bucket : ResourceBucket) : number
-	local Cutoff      = os.clock() - FAILURE_WINDOW
-	local WriteIndex  = 1
+	local Cutoff = os.clock() - FAILURE_WINDOW
+	local WriteIndex = 1
 	local ActiveCount = 0
 	for ReadIndex = 1, #Bucket.Failures do
 		if Bucket.Failures[ReadIndex] >= Cutoff then
@@ -69,7 +65,6 @@ local function IsInBackoff(Bucket : ResourceBucket) : boolean
 	return false
 end
 
--- ── Public API (resource-scoped) ──────────────────────────────────────────────
 
 local MemoryBudget = {}
 
@@ -79,8 +74,6 @@ function MemoryBudget.RecordFailure(Resource : string) : ()
 end
 
 function MemoryBudget.RecordSuccess(Resource : string) : ()
-	-- Successful operations erode the failure window by removing one entry.
-	-- This provides faster recovery when errors are intermittent.
 	local Bucket = GetBucket(Resource)
 	if #Bucket.Failures > 0 then
 		table.remove(Bucket.Failures, 1)
@@ -102,7 +95,7 @@ function MemoryBudget.WaitForCapacity(Resource : string) : Result<boolean>
 	if not Bucket.Queues["_default"] then Bucket.Queues["_default"] = {} end
 
 	local Entry : QueuedOperation = {
-		Thread     = coroutine.running(),
+		Thread = coroutine.running(),
 		EnqueuedAt = os.clock(),
 	}
 	table.insert(Bucket.Queues["_default"], Entry)
@@ -117,15 +110,15 @@ function MemoryBudget.WaitForCapacity(Resource : string) : Result<boolean>
 end
 
 function MemoryBudget.GetStatus(Resource : string) : {
-	InBackoff          : boolean,
-	BackoffRemaining   : number,
+	InBackoff : boolean,
+	BackoffRemaining : number,
 	RecentFailureCount : number,
 	}
-	local Bucket     = GetBucket(Resource)
+	local Bucket = GetBucket(Resource)
 	local CurrentTime = os.clock()
 	return {
-		InBackoff          = IsInBackoff(Bucket),
-		BackoffRemaining   = math.max(0, Bucket.BackoffUntil - CurrentTime),
+		InBackoff = IsInBackoff(Bucket),
+		BackoffRemaining = math.max(0, Bucket.BackoffUntil - CurrentTime),
 		RecentFailureCount = #Bucket.Failures,
 	}
 end
@@ -138,12 +131,12 @@ function MemoryBudget.Reset(Resource : string?) : ()
 			Bucket.BackoffUntil = 0
 		end
 	else
-		-- Global reset (test helper)
+
 		table.clear(Buckets)
 	end
 end
 
--- ── Drainer (one per resource, self-terminating) ──────────────────────────────
+
 
 function MemoryBudget._EnsureDrainer(Resource : string) : ()
 	local Bucket = GetBucket(Resource)
