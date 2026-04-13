@@ -31,13 +31,11 @@ type InternalStats = {
 	LastOperationTime : number,
 }
 
-local OperationData : { [string] : InternalStats } = {}
+local GlobalData : { [string] : InternalStats } = {}
 
-local function EnsureOperation(OperationName : string) : InternalStats
-	local Existing = OperationData[OperationName]
-	if Existing then
-		return Existing
-	end
+local function EnsureStats(Pool : { [string] : InternalStats }, OperationName : string) : InternalStats
+	local Existing = Pool[OperationName]
+	if Existing then return Existing end
 	local NewStats : InternalStats = {
 		TotalCount = 0,
 		SuccessCount = 0,
@@ -49,29 +47,23 @@ local function EnsureOperation(OperationName : string) : InternalStats
 		LastErrorMessage = nil,
 		LastOperationTime = 0,
 	}
-	OperationData[OperationName] = NewStats
+	Pool[OperationName] = NewStats
 	return NewStats
 end
 
-function Telemetry.Record(
+local function RecordToPool(
+	Pool : { [string] : InternalStats },
 	OperationName : string,
 	Latency : number,
 	Success : boolean,
 	ErrorInfo : NexusError?
 ) : ()
-	local Stats = EnsureOperation(OperationName)
-
+	local Stats = EnsureStats(Pool, OperationName)
 	Stats.TotalCount += 1
 	Stats.TotalLatency += Latency
 	Stats.LastOperationTime = os.clock()
-
-	if Latency < Stats.MinLatency then
-		Stats.MinLatency = Latency
-	end
-	if Latency > Stats.MaxLatency then
-		Stats.MaxLatency = Latency
-	end
-
+	if Latency < Stats.MinLatency then Stats.MinLatency = Latency end
+	if Latency > Stats.MaxLatency then Stats.MaxLatency = Latency end
 	if Success then
 		Stats.SuccessCount += 1
 	else
@@ -84,26 +76,7 @@ function Telemetry.Record(
 	end
 end
 
-function Telemetry.RecordResult(
-	OperationName : string,
-	Latency : number,
-	OperationResult : { Passed : boolean }
-) : ()
-	if OperationResult.Passed then
-		Telemetry.Record(OperationName, Latency, true)
-	else
-		Telemetry.Record(
-			OperationName, Latency, false,
-			(OperationResult :: any).Error :: NexusError?
-		)
-	end
-end
-
-function Telemetry.GetOperation(OperationName : string) : OperationStats?
-	local Stats = OperationData[OperationName]
-	if not Stats then
-		return nil
-	end
+local function StatsToPublic(Stats : InternalStats) : OperationStats
 	return {
 		TotalCount = Stats.TotalCount,
 		SuccessCount = Stats.SuccessCount,
@@ -111,19 +84,73 @@ function Telemetry.GetOperation(OperationName : string) : OperationStats?
 		TotalLatency = Stats.TotalLatency,
 		MinLatency = if Stats.MinLatency == math.huge then 0 else Stats.MinLatency,
 		MaxLatency = Stats.MaxLatency,
-		MeanLatency = if Stats.TotalCount > 0
-			then Stats.TotalLatency / Stats.TotalCount
-			else 0,
+		MeanLatency = if Stats.TotalCount > 0 then Stats.TotalLatency / Stats.TotalCount else 0,
 		ErrorCounts = table.clone(Stats.ErrorCounts),
 		LastErrorMessage = Stats.LastErrorMessage,
 		LastOperationTime = Stats.LastOperationTime,
 	}
 end
 
+export type TelemetryScope = {
+	_Pool : { [string] : InternalStats },
+	_Name : string,
+	Record : (self : TelemetryScope, OperationName : string, Latency : number, Success : boolean, ErrorInfo : NexusError?) -> (),
+	GetOperation : (self : TelemetryScope, OperationName : string) -> OperationStats?,
+	GetReport : (self : TelemetryScope) -> { [string] : OperationStats },
+	Reset : (self : TelemetryScope) -> (),
+}
+
+function Telemetry.CreateScope(Name : string) : TelemetryScope
+	local Pool : { [string] : InternalStats } = {}
+	local Scope = {} :: any
+	Scope._Pool = Pool
+	Scope._Name = Name
+
+	Scope.Record = function(_self : TelemetryScope, OperationName : string, Latency : number, Success : boolean, ErrorInfo : NexusError?)
+		RecordToPool(Pool, OperationName, Latency, Success, ErrorInfo)
+		RecordToPool(GlobalData, OperationName, Latency, Success, ErrorInfo)
+	end
+
+	Scope.GetOperation = function(_self : TelemetryScope, OperationName : string) : OperationStats?
+		local Stats = Pool[OperationName]
+		if not Stats then return nil end
+		return StatsToPublic(Stats)
+	end
+
+	Scope.GetReport = function(_self : TelemetryScope) : { [string] : OperationStats }
+		local Report : { [string] : OperationStats } = {}
+		for OpName, Stats in Pool do
+			Report[OpName] = StatsToPublic(Stats)
+		end
+		return Report
+	end
+
+	Scope.Reset = function(_self : TelemetryScope)
+		table.clear(Pool)
+	end
+
+	return Scope
+end
+
+function Telemetry.Record(
+	OperationName : string,
+	Latency : number,
+	Success : boolean,
+	ErrorInfo : NexusError?
+) : ()
+	RecordToPool(GlobalData, OperationName, Latency, Success, ErrorInfo)
+end
+
+function Telemetry.GetOperation(OperationName : string) : OperationStats?
+	local Stats = GlobalData[OperationName]
+	if not Stats then return nil end
+	return StatsToPublic(Stats)
+end
+
 function Telemetry.GetReport() : { [string] : OperationStats }
 	local Report : { [string] : OperationStats } = {}
-	for OperationName, _ in OperationData do
-		Report[OperationName] = Telemetry.GetOperation(OperationName) :: OperationStats
+	for OperationName, Stats in GlobalData do
+		Report[OperationName] = StatsToPublic(Stats)
 	end
 	return Report
 end
@@ -135,18 +162,13 @@ function Telemetry.GetSummary() : {
 	OverallSuccessRate : number,
 	TrackedOperations : number,
 }
-	local TotalOps = 0
-	local TotalOk = 0
-	local TotalFail = 0
-	local OpCount = 0
-
-	for _, Stats in OperationData do
+	local TotalOps, TotalOk, TotalFail, OpCount = 0, 0, 0, 0
+	for _, Stats in GlobalData do
 		TotalOps += Stats.TotalCount
 		TotalOk += Stats.SuccessCount
 		TotalFail += Stats.FailureCount
 		OpCount += 1
 	end
-
 	return {
 		TotalOperations = TotalOps,
 		TotalSuccesses = TotalOk,
@@ -158,7 +180,7 @@ end
 
 function Telemetry.GetTrackedOperations() : { string }
 	local Names : { string } = {}
-	for OperationName, _ in OperationData do
+	for OperationName, _ in GlobalData do
 		table.insert(Names, OperationName)
 	end
 	table.sort(Names)
@@ -166,11 +188,11 @@ function Telemetry.GetTrackedOperations() : { string }
 end
 
 function Telemetry.Reset() : ()
-	table.clear(OperationData)
+	table.clear(GlobalData)
 end
 
 function Telemetry.ResetOperation(OperationName : string) : ()
-	OperationData[OperationName] = nil
+	GlobalData[OperationName] = nil
 end
 
 return Telemetry

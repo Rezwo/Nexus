@@ -1,4 +1,5 @@
 --!strict
+
 local Types = require(script.Types)
 local Errors = require(script.Errors)
 local Store = require(script.Store)
@@ -11,6 +12,8 @@ local PlayerStoreModule = require(script.PlayerStore)
 local Telemetry = require(script.Telemetry)
 local InboxModule = require(script.Inbox)
 local Budget = require(script.Budget)
+local MemoryBudget = require(script.MemoryBudget)
+local Transaction = require(script.Transaction)
 
 export type Result<Value> = Types.Result<Value>
 export type SuccessResult<Value> = Types.SuccessResult<Value>
@@ -40,9 +43,16 @@ export type LeaderboardConfiguration = Leaderboard.LeaderboardConfiguration
 export type PlayerStore<DataType> = PlayerStoreModule.PlayerStoreObject<DataType>
 export type PlayerStoreConfiguration<DataType> = PlayerStoreModule.PlayerStoreConfiguration<DataType>
 export type OperationStats = Telemetry.OperationStats
+export type TelemetryScope = Telemetry.TelemetryScope
 export type InboxManager = InboxModule.InboxManager
 export type InboxItem = InboxModule.InboxItem
 export type InboxConfiguration = InboxModule.InboxConfiguration
+export type BatchResult<DataType> = Types.BatchResult<DataType>
+export type PageCursor = Types.PageCursor
+export type AuditEntry = Types.AuditEntry
+export type MiddlewarePhase = Types.MiddlewarePhase
+export type DebugContext = Types.DebugContext
+export type SoftDeleteInfo = Types.SoftDeleteInfo
 
 local Nexus = {}
 
@@ -62,8 +72,9 @@ Nexus.DeepClone = Validation.DeepClone
 Nexus.DeepEqual = Validation.DeepEqual
 
 Nexus.Lifecycle = Lifecycle
-
 Nexus.Telemetry = Telemetry
+Nexus.Budget = Budget
+Nexus.MemoryBudget = MemoryBudget
 
 Nexus.CreateSemaphore = Semaphore.New
 
@@ -75,8 +86,6 @@ function Nexus.GetWriteSemaphoreInfo() : {
 	return Semaphore.Global:GetInfo()
 end
 
-Nexus.Budget = Budget
-
 function Nexus.SetRateLimit(
 	RequestType : Enum.DataStoreRequestType,
 	BaseLimit : number,
@@ -84,6 +93,82 @@ function Nexus.SetRateLimit(
 ) : ()
 	local DataStoreService = game:GetService("DataStoreService");
 	(DataStoreService :: any):SetRateLimitForRequestType(RequestType, BaseLimit, PerPlayerLimit)
+end
+
+function Nexus.SetDebugMode(Enabled : boolean) : ()
+	Store.SetGlobalDebugMode(Enabled)
+end
+
+function Nexus.SetDebugHandler(Handler : ((Types.DebugContext) -> ())?) : ()
+	Store.SetGlobalDebugHandler(Handler)
+end
+
+function Nexus.Transact(
+	Participants : { { Store : Store.StoreObject<any>, Key : string, Transform : (Data : any) -> any? } },
+	Configuration : TransactionConfiguration?
+) : TransactionResult
+	local TransactionInstance = Transaction.New(Configuration)
+
+	for _, Entry in Participants do
+		TransactionInstance:Add(Entry.Store, Entry.Key, Entry.Transform :: any)
+	end
+
+	local AllParticipants = TransactionInstance:GetParticipants()
+	for Index, ParticipantData in AllParticipants do
+		local TypedStore = ParticipantData.StoreReference :: Store.StoreObject<any>
+		local TargetSession = TypedStore._Sessions[ParticipantData.Key]
+		if TargetSession then
+			TransactionInstance:SetSnapshot(Index, Validation.DeepClone(TargetSession._Data))
+		end
+	end
+
+	return TransactionInstance:ExecuteOptimistic(
+		function(StoreReference : unknown, Key : string, Transform : (Data : unknown) -> unknown?) : Types.Result<unknown>
+			local TypedStore = StoreReference :: Store.StoreObject<any>
+			return TypedStore:Update(Key, Transform :: any) :: any
+		end,
+		function(StoreReference : unknown, Key : string, Snapshot : unknown) : Types.Result<boolean>
+			local TypedStore = StoreReference :: Store.StoreObject<any>
+			local TargetSession = TypedStore._Sessions[Key]
+			if TargetSession then
+				TargetSession._Data = Snapshot
+				TargetSession._Dirty = true
+				local PersistResult = TypedStore:Save(Key)
+				if not PersistResult.Passed then
+					warn(`[Nexus] Cross-store transaction: rollback persist failed for '{Key}'`)
+				end
+			end
+			return Errors.Passed(true)
+		end)
+end
+
+local function CheckErrorKind(OperationResult : Types.Result<any>, Kind : Types.ErrorKind) : boolean
+	if OperationResult.Passed then return false end
+	return (OperationResult :: Types.ErrorResult).Error.Kind == Kind
+end
+
+function Nexus.IsSessionLocked(OperationResult : Types.Result<any>) : boolean
+	return CheckErrorKind(OperationResult, "SessionLocked")
+end
+
+function Nexus.IsThrottled(OperationResult : Types.Result<any>) : boolean
+	return CheckErrorKind(OperationResult, "Throttled")
+end
+
+function Nexus.IsDataStoreError(OperationResult : Types.Result<any>) : boolean
+	return CheckErrorKind(OperationResult, "DataStoreError")
+end
+
+function Nexus.IsValidationError(OperationResult : Types.Result<any>) : boolean
+	return CheckErrorKind(OperationResult, "ValidationFailed")
+end
+
+function Nexus.IsBudgetExhausted(OperationResult : Types.Result<any>) : boolean
+	return CheckErrorKind(OperationResult, "BudgetExhausted")
+end
+
+function Nexus.IsSessionNotFound(OperationResult : Types.Result<any>) : boolean
+	return CheckErrorKind(OperationResult, "SessionNotFound")
 end
 
 function Nexus.CreateLeaderboard(
@@ -104,7 +189,7 @@ function Nexus.CreateInbox(
 	return InboxModule.New(Configuration)
 end
 
-Nexus.VERSION = "3.5.0"
+Nexus.VERSION = "4.0.0"
 
 Nexus.LockMode = {
 	Session = "Session" :: Types.LockMode,

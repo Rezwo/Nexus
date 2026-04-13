@@ -69,24 +69,18 @@ export type SchemaDefinition<DataType> = {
 }
 
 export type Envelope<DataType> = {
-
-
 	_v : number,
 	_c : boolean?,
 	_d : DataType | string,
 	_lock : LockInfo?,
-
-
 	_s : number?,
+	_deleted : boolean?,
+	_deletedAt : number?,
 }
 
 export type LockInfo = {
-
-
 	jobId : string,
-
 	renewedAt : number,
-
 	lockVersion : number,
 }
 
@@ -112,16 +106,17 @@ export type StoreConfiguration<DataType> = {
 	AutoSaveInterval : number?,
 	Compress : boolean?,
 	CompressionThreshold : number?,
-
 	CompressionLevel : number?,
 	MaxRetries : number?,
 	Strict : boolean?,
 	GetUserIds : ((Key : string) -> { number })?,
-
-
-
-
 	ShardThreshold : number?,
+	ValidateOnLoad : boolean?,
+	DebounceInterval : number?,
+	SoftDeleteRetention : number?,
+	AuditLog : boolean?,
+	AuditLogSize : number?,
+	Debug : boolean?,
 }
 
 export type LockMode =
@@ -182,6 +177,44 @@ export type StoreCallbacks<DataType> = {
 	OnError : ((Key : string, Error : NexusError) -> ())?,
 	OnConflict : ((Key : string, LocalData : DataType, RemoteData : DataType) -> DataType)?,
 	OnMigration : ((Key : string, FromVersion : number, ToVersion : number) -> ())?,
+	BeforeSave : ((Key : string, Data : DataType) -> DataType?)?,
+	AfterLoad : ((Key : string, Data : DataType) -> DataType?)?,
+}
+
+export type BatchResult<DataType> = {
+	Succeeded : { [string] : DataType },
+	Failed : { [string] : NexusError },
+}
+
+export type PageCursor = {
+	_Pages : any,
+	_Done : boolean,
+	_PageCount : number,
+	_MaxPages : number,
+}
+
+export type AuditEntry = {
+	Timestamp : number,
+	Operation : string,
+	Before : unknown?,
+	After : unknown?,
+	Source : string,
+	SessionId : string,
+}
+
+export type MiddlewarePhase = "load" | "save"
+
+export type DebugContext = {
+	Store : string,
+	Key : string?,
+	Operation : string,
+	Elapsed : number?,
+}
+
+export type SoftDeleteInfo = {
+	Key : string,
+	DeletedAt : number,
+	ExpiresAt : number?,
 }
 
 return Types
