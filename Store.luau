@@ -145,6 +145,7 @@ export type StoreObject<DataType> = {
 	_WriteEnvelope : (self : StoreObject<DataType>, Key : string, WriteEnvelope : Envelope<DataType>, UserIds : { number }?) -> Result<boolean>,
 	_WriteEnvelopeInner : (self : StoreObject<DataType>, Key : string, WriteEnvelope : Envelope<DataType>, UserIds : { number }?) -> Result<boolean>,
 	_PerformDebouncedSave : (self : StoreObject<DataType>, Key : string) -> Result<boolean>,
+	_FinalizeSave : (self : StoreObject<DataType>, Key : string, TargetSession : SessionModule.SessionObject<DataType>, SaveEnvelope : Envelope<DataType>, UserIds : { number }?, MiddlewareData : DataType) -> Result<boolean>,
 	_CommitParticipantCAS : (self : StoreObject<DataType>, Key : string, Transform : (Data : DataType) -> DataType?, ExpectedTxv : number, UserIds : { number }?) -> Result<boolean>,
 	_RecordAudit : (self : StoreObject<DataType>, Key : string, Operation : string, Before : unknown?, After : unknown?) -> (),
 	_FlushAuditLog : (self : StoreObject<DataType>, Key : string) -> (),
@@ -627,6 +628,8 @@ function Store._PerformDebouncedSave<DataType>(self : StoreObject<DataType>, Key
 		self:_WaitForWriteCooldown(Key)
 	end
 
+	local SaveDataForMiddleware : DataType = TargetSession._Data
+
 	if self._Callbacks.BeforeSave then
 		local DataForWire = self._Callbacks.BeforeSave(Key, Validation.DeepClone(TargetSession._Data))
 		if DataForWire == nil then
@@ -642,40 +645,16 @@ function Store._PerformDebouncedSave<DataType>(self : StoreObject<DataType>, Key
 			TargetSession:SetStatus("Active")
 			return Errors.Fail((EnvelopeResult :: Types.ErrorResult).Error)
 		end
-
+		SaveDataForMiddleware = DataForWire
 		local SaveEnvelope = (EnvelopeResult :: Types.SuccessResult<Envelope<DataType>>).Value
 		local UserIds = TargetSession:GetUserIds()
-
-		if self._Middleware:HasMiddleware("save") then
-			self._Middleware:Run("save", Key, DataForWire)
-		end
 
 		if self._LockManager then
 			local CurrentLockInfo = self._LockManager:ToLockInfo(Key)
 			if CurrentLockInfo then SaveEnvelope._lock = CurrentLockInfo end
 		end
 
-		local WriteResult = self:_WriteEnvelope(Key, SaveEnvelope, UserIds)
-		self._LastWriteTime[Key] = os.clock()
-
-		if not WriteResult.Passed then
-			TargetSession:SetStatus("Active")
-			local SaveError = (WriteResult :: Types.ErrorResult).Error
-			SaveError.Key = Key
-			self.OnError:Fire(Key, SaveError)
-			if self._Callbacks.OnError then self._Callbacks.OnError(Key, SaveError) end
-			return Errors.Fail(SaveError)
-		end
-
-		TargetSession:SetStatus("Active")
-		TargetSession:MarkSaved()
-		self:_RecordAudit(Key, "Save", Validation.DeepClone(TargetSession._Data), TargetSession._Data)
-		self:_FlushAuditLog(Key)
-
-		self.OnSave:Fire(Key, TargetSession._Data)
-		if self._Callbacks.OnSave then self._Callbacks.OnSave(Key, TargetSession._Data) end
-
-		return Errors.Passed(true)
+		return self:_FinalizeSave(Key, TargetSession, SaveEnvelope, UserIds, SaveDataForMiddleware)
 	end
 
 	local EnvelopeResult = TargetSession:BuildEnvelope()
@@ -687,15 +666,24 @@ function Store._PerformDebouncedSave<DataType>(self : StoreObject<DataType>, Key
 	local SaveEnvelope = (EnvelopeResult :: Types.SuccessResult<Envelope<DataType>>).Value
 	local UserIds = TargetSession:GetUserIds()
 
-	if self._Middleware:HasMiddleware("save") then
-		self._Middleware:Run("save", Key, TargetSession._Data)
-	end
-
 	if self._LockManager then
 		local CurrentLockInfo = self._LockManager:ToLockInfo(Key)
-		if CurrentLockInfo then
-			SaveEnvelope._lock = CurrentLockInfo
-		end
+		if CurrentLockInfo then SaveEnvelope._lock = CurrentLockInfo end
+	end
+
+	return self:_FinalizeSave(Key, TargetSession, SaveEnvelope, UserIds, SaveDataForMiddleware)
+end
+
+function Store._FinalizeSave<DataType>(
+	self : StoreObject<DataType>,
+	Key : string,
+	TargetSession : SessionModule.SessionObject<DataType>,
+	SaveEnvelope : Envelope<DataType>,
+	UserIds : { number }?,
+	MiddlewareData : DataType
+) : Result<boolean>
+	if self._Middleware:HasMiddleware("save") then
+		self._Middleware:Run("save", Key, MiddlewareData)
 	end
 
 	local WriteResult = self:_WriteEnvelope(Key, SaveEnvelope, UserIds)
@@ -1317,14 +1305,18 @@ function Store.Transact<DataType>(
 			if Attempt < MaxRetryCount then
 				task.wait(0.1 * (2 ^ (Attempt - 1)) + math.random() * 0.1)
 				for _, ParticipantEntry in Participants do
-					local PeekResult = Retry.WrapPcall("DataStoreError", function()
-						return self._DataStore:GetAsync(ParticipantEntry.Key)
-					end, { MaxRetries = 2, BudgetType = "GetAsync" } :: any)
-					if PeekResult.Passed then
-						local RawData = (PeekResult :: Types.SuccessResult<unknown>).Value
-						if typeof(RawData) == "table" then
-							local RemoteTable = RawData :: any
-							self._LastKnownTxv[ParticipantEntry.Key] = typeof(RemoteTable._txv) == "number" and RemoteTable._txv or 0
+					local CachedTxv = self._LastKnownTxv[ParticipantEntry.Key]
+					local SnapshotTxv = ParticipantSnapshots[ParticipantEntry.Key].TransactionVersion
+					if CachedTxv == nil or CachedTxv == SnapshotTxv then
+						local PeekResult = Retry.WrapPcall("DataStoreError", function()
+							return self._DataStore:GetAsync(ParticipantEntry.Key)
+						end, { MaxRetries = 2, BudgetType = "GetAsync" } :: any)
+						if PeekResult.Passed then
+							local RawData = (PeekResult :: Types.SuccessResult<unknown>).Value
+							if typeof(RawData) == "table" then
+								local RemoteTable = RawData :: any
+								self._LastKnownTxv[ParticipantEntry.Key] = typeof(RemoteTable._txv) == "number" and RemoteTable._txv or 0
+								end
 						end
 					end
 				end
@@ -1478,7 +1470,7 @@ function Store.ListKeys<DataType>(self : StoreObject<DataType>, Prefix : string?
 	while true do
 		PageCount += 1
 		for _, Item in Pages:GetCurrentPage() do
-			if not string.find(Item.KeyName, "_shard_%d+$") then
+			if not string.match(Item.KeyName, "_shard_%d+$") then
 				table.insert(Keys, Item.KeyName :: string)
 			end
 		end
@@ -1520,7 +1512,7 @@ function Store.NextPage<DataType>(self : StoreObject<DataType>, Cursor : PageCur
 	Cursor._PageCount += 1
 	local Keys : { string } = {}
 	for _, Item in Pages:GetCurrentPage() do
-		if not string.find(Item.KeyName, "_shard_%d+$") then
+		if not string.match(Item.KeyName, "_shard_%d+$") then
 			table.insert(Keys, Item.KeyName :: string)
 		end
 	end
@@ -1562,13 +1554,13 @@ function Store.SoftDelete<DataType>(self : StoreObject<DataType>, Key : string) 
 	end, { MaxRetries = 3, BudgetType = "UpdateAsync" } :: any)
 
 	self._Telemetry:Record("Store.SoftDelete", os.clock() - StartTime, WriteResult.Passed)
-	self:_RecordAudit(Key, "SoftDelete", RawData, nil)
 
 	if not WriteResult.Passed then
 		self._SoftDeleted[Key] = nil
 		return Errors.Fail((WriteResult :: Types.ErrorResult).Error)
 	end
 
+	self:_RecordAudit(Key, "SoftDelete", RawData, nil)
 	return Errors.Passed(true)
 end
 
@@ -1772,9 +1764,12 @@ function Store._FlushAuditLog<DataType>(self : StoreObject<DataType>, Key : stri
 		end
 
 
-		pcall(function()
+		local ManifestSuccess, ManifestError = pcall(function()
 			self._DataStore:SetAsync(AuditKey, { _s = NewShardCount })
 		end)
+		if not ManifestSuccess then
+			warn(`[Nexus] _FlushAuditLog: manifest SetAsync failed for '{AuditKey}': {ManifestError}`)
+		end
 
 
 		if OldAuditShardCount > NewShardCount then
@@ -1785,12 +1780,15 @@ function Store._FlushAuditLog<DataType>(self : StoreObject<DataType>, Key : stri
 		self:_DebugLog("AuditFlush.Sharded", Key)
 	else
 
-		pcall(function()
+		local DirectSuccess, DirectError = pcall(function()
 			self._DataStore:SetAsync(AuditKey, {
 				_c = true,
 				_d = CompressedPayload,
 			})
 		end)
+		if not DirectSuccess then
+			warn(`[Nexus] _FlushAuditLog: SetAsync failed for '{AuditKey}': {DirectError}`)
+		end
 
 
 		if OldAuditShardCount > 0 then
