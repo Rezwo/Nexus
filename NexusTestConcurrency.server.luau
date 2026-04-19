@@ -2,6 +2,7 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local NexusTestHelpers = require(ReplicatedStorage.Nexus.NexusTestHelpers)
 local Nexus = NexusTestHelpers.Nexus
+local MockDataStore = NexusTestHelpers.MockDataStore
 local Assert = NexusTestHelpers.Assert
 local Section = NexusTestHelpers.Section
 

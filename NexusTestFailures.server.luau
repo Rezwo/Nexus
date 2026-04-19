@@ -16,7 +16,10 @@ Section("F-ERROR-SHAPES: DataStore Errors")
 do
 	local Harness = NexusTestHelpers.TestHarness.New()
 	local Store = Harness:CreateStore({ Name = "Failures_ErrorShapes", Schema = TestSchema })
-	MockDataStore.Fault("Failures_ErrorShapes", "GetAsync", "Fake DataStore throttle")
+	-- Push multiple faults to exceed the retry limit (default 3-5)
+	for i = 1, 6 do
+		MockDataStore.Fault("Failures_ErrorShapes", "GetAsync", "Fake DataStore throttle")
+	end
 	local LoadResult = Store:Load("ErrShapeKey")
 	Assert(LoadResult.Passed == false, "[expected] Load fails due to generic DataStoreError")
 	Assert(Nexus.IsDataStoreError(LoadResult), "Result is DataStoreError")
