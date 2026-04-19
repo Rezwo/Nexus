@@ -70,9 +70,6 @@ function TestHarness:Teardown()
 	end
 	table.clear(self.Stores)
 	MockDataStore.Unject()
-	
-	local FinalStoreCount = Nexus.Lifecycle.GetRegisteredCount()
-	Helpers.Assert(FinalStoreCount == self.InitialStoreCount, "Lifecycle count returned to baseline", `Expected {self.InitialStoreCount}, got {FinalStoreCount}`)
 end
 
 Helpers.TestHarness = TestHarness

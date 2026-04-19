@@ -111,6 +111,7 @@ function MockDataStore.GetAsync(self : MockStore, Key : string) : unknown
 	if ShouldFail(self._Options) then
 		error("[MockDataStore] Simulated GetAsync failure", 2)
 	end
+	MockDataStore._CheckFaults(self, "GetAsync")
 	local State = self._Data[Key]
 	if not State then return nil end
 	return State.Current
@@ -130,8 +131,6 @@ function MockDataStore.SetAsync(
 	end
 
 	MockDataStore._CheckFaults(self, "SetAsync")
-
-	MockDataStore._CheckFaults(self, "GetAsync")
 	local State = GetOrCreate(self, Key)
 	State.Current = Value
 	RecordVersion(State, Value, Value == nil)
@@ -147,7 +146,6 @@ function MockDataStore.UpdateAsync(
 	if ShouldFail(self._Options) then
 		error("[MockDataStore] Simulated UpdateAsync failure", 2)
 	end
-
 	MockDataStore._CheckFaults(self, "UpdateAsync")
 	local State = GetOrCreate(self, Key)
 	local NewValue = Callback(State.Current)
@@ -164,6 +162,7 @@ function MockDataStore.RemoveAsync(self : MockStore, Key : string) : unknown
 	if ShouldFail(self._Options) then
 		error("[MockDataStore] Simulated RemoveAsync failure", 2)
 	end
+	MockDataStore._CheckFaults(self, "RemoveAsync")
 	local State = self._Data[Key]
 	if not State then return nil end
 	local OldValue = State.Current
@@ -257,8 +256,7 @@ function MockDataStore.ListVersionsAsync(
 	if ShouldFail(self._Options) then
 		error("[MockDataStore] Simulated ListVersionsAsync failure", 2)
 	end
-
-	MockDataStore._CheckFaults(self, "ListKeysAsync")
+	MockDataStore._CheckFaults(self, "ListVersionsAsync")
 
 	local State = self._Data[Key]
 	local AllVersions : { VersionEntry } = if State then table.clone(State.Versions) else {}
@@ -305,10 +303,7 @@ function MockDataStore.GetVersionAsync(
 	if ShouldFail(self._Options) then
 		error("[MockDataStore] Simulated GetVersionAsync failure", 2)
 	end
-
 	MockDataStore._CheckFaults(self, "GetVersionAsync")
-
-	MockDataStore._CheckFaults(self, "ListVersionsAsync")
 	local State = self._Data[Key]
 	if not State then return nil, nil end
 	for _, V in State.Versions do
