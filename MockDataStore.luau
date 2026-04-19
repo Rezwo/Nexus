@@ -128,6 +128,10 @@ function MockDataStore.SetAsync(
 	if ShouldFail(self._Options) then
 		error("[MockDataStore] Simulated SetAsync failure", 2)
 	end
+
+	MockDataStore._CheckFaults(self, "SetAsync")
+
+	MockDataStore._CheckFaults(self, "GetAsync")
 	local State = GetOrCreate(self, Key)
 	State.Current = Value
 	RecordVersion(State, Value, Value == nil)
@@ -143,6 +147,8 @@ function MockDataStore.UpdateAsync(
 	if ShouldFail(self._Options) then
 		error("[MockDataStore] Simulated UpdateAsync failure", 2)
 	end
+
+	MockDataStore._CheckFaults(self, "UpdateAsync")
 	local State = GetOrCreate(self, Key)
 	local NewValue = Callback(State.Current)
 	if NewValue ~= nil then
@@ -172,6 +178,8 @@ function MockDataStore.IncrementAsync(self : MockStore, Key : string, Delta : nu
 	if ShouldFail(self._Options) then
 		error("[MockDataStore] Simulated IncrementAsync failure", 2)
 	end
+
+	MockDataStore._CheckFaults(self, "RemoveAsync")
 	local State = GetOrCreate(self, Key)
 	local Current = State.Current
 	local CurrentNum = if typeof(Current) == "number" then Current else 0
@@ -192,6 +200,8 @@ function MockDataStore.ListKeysAsync(
 	if ShouldFail(self._Options) then
 		error("[MockDataStore] Simulated ListKeysAsync failure", 2)
 	end
+
+	MockDataStore._CheckFaults(self, "IncrementAsync")
 
 	local AllKeys : { string } = {}
 	for Key in self._Data do
@@ -248,6 +258,8 @@ function MockDataStore.ListVersionsAsync(
 		error("[MockDataStore] Simulated ListVersionsAsync failure", 2)
 	end
 
+	MockDataStore._CheckFaults(self, "ListKeysAsync")
+
 	local State = self._Data[Key]
 	local AllVersions : { VersionEntry } = if State then table.clone(State.Versions) else {}
 	table.sort(AllVersions, function(A, B) return A.CreatedTime > B.CreatedTime end)
@@ -293,6 +305,10 @@ function MockDataStore.GetVersionAsync(
 	if ShouldFail(self._Options) then
 		error("[MockDataStore] Simulated GetVersionAsync failure", 2)
 	end
+
+	MockDataStore._CheckFaults(self, "GetVersionAsync")
+
+	MockDataStore._CheckFaults(self, "ListVersionsAsync")
 	local State = self._Data[Key]
 	if not State then return nil, nil end
 	for _, V in State.Versions do
@@ -392,6 +408,68 @@ end
 
 function MockDataStore.ClearRegistry() : ()
 	table.clear(Registry)
+end
+
+
+local Faults : { [string] : { [string] : { any } } } = {}
+local Throttles : { [string] : number } = {}
+
+function MockDataStore.Fault(Name : string, Op : string, ErrorMessage : string) : ()
+	Faults[Name] = Faults[Name] or {}
+	Faults[Name][Op] = Faults[Name][Op] or {}
+	table.insert(Faults[Name][Op], ErrorMessage)
+end
+
+function MockDataStore.SimulateThrottle(Name : string, Count : number) : ()
+	Throttles[Name] = Count
+end
+
+function MockDataStore._CheckFaults(self : MockStore, Op : string) : ()
+	if Throttles[self._Name] and Throttles[self._Name] > 0 then
+		Throttles[self._Name] -= 1
+		error("HTTP 429 (Too Many Requests)", 3)
+	end
+	if Faults[self._Name] and Faults[self._Name][Op] and #Faults[self._Name][Op] > 0 then
+		local Err = table.remove(Faults[self._Name][Op], 1)
+		error(Err, 3)
+	end
+end
+
+local InjectionCount = 0
+local OriginalGetDataStore = nil
+local OriginalGetOrderedDataStore = nil
+
+function MockDataStore.Inject(Options : MockStoreOptions?) : ()
+	InjectionCount += 1
+	if InjectionCount > 1 then return end
+
+	local DataStoreService = game:GetService("DataStoreService")
+	OriginalGetDataStore = DataStoreService.GetDataStore
+	OriginalGetOrderedDataStore = DataStoreService.GetOrderedDataStore
+
+	(DataStoreService :: any).GetDataStore = function(self, Name : string, Scope : string?)
+		return MockDataStore.GetOrCreate(Name, Scope, Options)
+	end
+	(DataStoreService :: any).GetOrderedDataStore = function(self, Name : string, Scope : string?)
+		return MockDataStore.GetOrCreate(Name, Scope, Options)
+	end
+end
+
+function MockDataStore.Unject() : ()
+	if InjectionCount == 0 then return end
+	InjectionCount -= 1
+	if InjectionCount == 0 then
+		local DataStoreService = game:GetService("DataStoreService")
+		if OriginalGetDataStore then
+			(DataStoreService :: any).GetDataStore = OriginalGetDataStore
+		end
+		if OriginalGetOrderedDataStore then
+			(DataStoreService :: any).GetOrderedDataStore = OriginalGetOrderedDataStore
+		end
+		MockDataStore.ClearRegistry()
+		table.clear(Faults)
+		table.clear(Throttles)
+	end
 end
 
 return MockDataStore
