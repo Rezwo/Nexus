@@ -2,8 +2,9 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local NexusTestHelpers = require(ReplicatedStorage.Nexus.NexusTestHelpers)
 local Nexus = NexusTestHelpers.Nexus
-local Assert = NexusTestHelpers.Assert
-local Section = NexusTestHelpers.Section
+local Suite = NexusTestHelpers.CreateSuite()
+local Assert = Suite.Assert
+local Section = Suite.Section
 
 local ValidatedSchema = {
 	Version = 1,
@@ -81,3 +82,5 @@ do
 	
 	Harness:Teardown()
 end
+
+Suite.Summary()

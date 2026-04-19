@@ -35,6 +35,38 @@ function Helpers.CombinedSummary()
 	print(`{string.rep("=", 60)}`)
 end
 
+function Helpers.CreateSuite()
+	local Tally = { TestCount = 0, PassCount = 0, FailCount = 0, SectionCount = 0 }
+	local Suite = {}
+
+	Suite.Assert = function(Condition : boolean, TestName : string, Detail : string?)
+		Tally.TestCount += 1
+		if Condition then
+			Tally.PassCount += 1
+			print(`{PASS} {TestName}`)
+		else
+			Tally.FailCount += 1
+			local Prefix = if string.find(TestName:lower(), "expected") then "[expected] " else ""
+			warn(`{Prefix}{FAIL} {TestName}{if Detail then " · " .. Detail else ""}`)
+		end
+	end
+
+	Suite.Section = function(Title : string)
+		Tally.SectionCount += 1
+		print(`\n{string.rep("=", 60)}`)
+		print(`  {Title}`)
+		print(`{string.rep("=", 60)}`)
+	end
+
+	Suite.Summary = function()
+		print(`\n{string.rep("=", 60)}`)
+		print(`Total: {Tally.PassCount}/{Tally.TestCount} passed across {Tally.SectionCount} sections`)
+		print(`{string.rep("=", 60)}`)
+	end
+
+	return Suite
+end
+
 local TestHarness = {}
 TestHarness.__index = TestHarness
 
