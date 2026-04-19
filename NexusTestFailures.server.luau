@@ -110,8 +110,11 @@ end
 Section("F-INBOX: Update failures")
 do
 	local Harness = NexusTestHelpers.TestHarness.New()
-	local Inbox = Harness:CreateStore({ Name = "Failures_Inbox", Schema = TestSchema })
-	MockDataStore.Fault("Failures_Inbox", "UpdateAsync", "Inbox Update Fail")
+	local Inbox = Harness:CreateStore({ Name = "Failures_Inbox", Schema = TestSchema, LockMode = "None" })
+	-- Push multiple faults to exceed the retry limit
+	for i = 1, 6 do
+		MockDataStore.Fault("Failures_Inbox", "UpdateAsync", "Inbox Update Fail")
+	end
 	local Res = Inbox:Update("InboxKey", function(d) return d end)
 	Assert(Res.Passed == false, "[expected] Inbox updates can fail")
 	
