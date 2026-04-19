@@ -53,7 +53,7 @@ function Inbox.New(Configuration : InboxConfiguration) : InboxManager
 
 	local DataStoreOptions = Instance.new("DataStoreOptions")
 	DataStoreOptions.AllScopes = false
-	self._DataStore = DataStoreService:GetDataStore(
+	self._DataStore = (_G.NexusMockDataStoreService or DataStoreService):GetDataStore(
 		`{Configuration.Name}_Inbox`,
 		Configuration.Scope or "global",
 		DataStoreOptions

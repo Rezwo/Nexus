@@ -236,7 +236,7 @@ function Store.New<DataType>(Configuration : StoreConfiguration<DataType>) : Sto
 
 	local DataStoreOptions = Instance.new("DataStoreOptions")
 	DataStoreOptions.AllScopes = false
-	self._DataStore = DataStoreService:GetDataStore(
+	self._DataStore = (_G.NexusMockDataStoreService or DataStoreService):GetDataStore(
 		Configuration.Name, ResolvedConfiguration.Scope, DataStoreOptions
 	)
 

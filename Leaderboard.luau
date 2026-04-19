@@ -38,7 +38,7 @@ function Leaderboard.New(Configuration : LeaderboardConfiguration) : Leaderboard
 	self._SortDirection = if Configuration.Ascending
 		then Enum.SortDirection.Ascending
 		else Enum.SortDirection.Descending
-	self._OrderedStore = DataStoreService:GetOrderedDataStore(
+	self._OrderedStore = (_G.NexusMockDataStoreService or DataStoreService):GetOrderedDataStore(
 		Configuration.Name, Configuration.Scope or "global"
 	)
 	return self :: any

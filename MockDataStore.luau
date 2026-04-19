@@ -443,31 +443,22 @@ function MockDataStore.Inject(Options : MockStoreOptions?) : ()
 	InjectionCount += 1
 	if InjectionCount > 1 then return end
 
-	local DataStoreService = game:GetService("DataStoreService")
-	OriginalGetDataStore = DataStoreService.GetDataStore
-	OriginalGetOrderedDataStore = DataStoreService.GetOrderedDataStore
-
-	local AnyDSS = DataStoreService :: any
-	AnyDSS.GetDataStore = function(self, Name : string, Scope : string?)
+	local MockProvider = {}
+	MockProvider.GetDataStore = function(self, Name : string, Scope : string?)
 		return MockDataStore.GetOrCreate(Name, Scope, Options)
 	end
-	AnyDSS.GetOrderedDataStore = function(self, Name : string, Scope : string?)
+	MockProvider.GetOrderedDataStore = function(self, Name : string, Scope : string?)
 		return MockDataStore.GetOrCreate(Name, Scope, Options)
 	end
+	
+	_G.NexusMockDataStoreService = MockProvider
 end
 
 function MockDataStore.Unject() : ()
 	if InjectionCount == 0 then return end
 	InjectionCount -= 1
 	if InjectionCount == 0 then
-		local DataStoreService = game:GetService("DataStoreService")
-		local AnyDSS = DataStoreService :: any
-		if OriginalGetDataStore then
-			AnyDSS.GetDataStore = OriginalGetDataStore
-		end
-		if OriginalGetOrderedDataStore then
-			AnyDSS.GetOrderedDataStore = OriginalGetOrderedDataStore
-		end
+		_G.NexusMockDataStoreService = nil
 		MockDataStore.ClearRegistry()
 		table.clear(Faults)
 		table.clear(Throttles)

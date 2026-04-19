@@ -83,11 +83,12 @@ do
 	local Harness = NexusTestHelpers.TestHarness.New()
 	local Store = Harness:CreateStore({ Name = "Failures_Shard", Schema = TestSchema })
 	
-	MockDataStore.Seed("Failures_Shard:global", "ShardKey", {
+	local ShardDS = MockDataStore.GetOrCreate("Failures_Shard", "global")
+	ShardDS:Seed("ShardKey", {
 		__shards = 5,
 		__v = 1
 	})
-	MockDataStore.Seed("Failures_Shard:global", "ShardKey_shard_1", "part1")
+	ShardDS:Seed("ShardKey_shard_1", "part1")
 	
 	local LoadR = Store:Load("ShardKey")
 	Assert(LoadR.Passed == false, "[expected] Load fails when a shard is missing")
