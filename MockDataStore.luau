@@ -447,10 +447,10 @@ function MockDataStore.Inject(Options : MockStoreOptions?) : ()
 	OriginalGetDataStore = DataStoreService.GetDataStore
 	OriginalGetOrderedDataStore = DataStoreService.GetOrderedDataStore
 
-	(DataStoreService :: any).GetDataStore = function(self, Name : string, Scope : string?)
+	;(DataStoreService :: any).GetDataStore = function(self, Name : string, Scope : string?)
 		return MockDataStore.GetOrCreate(Name, Scope, Options)
 	end
-	(DataStoreService :: any).GetOrderedDataStore = function(self, Name : string, Scope : string?)
+	;(DataStoreService :: any).GetOrderedDataStore = function(self, Name : string, Scope : string?)
 		return MockDataStore.GetOrCreate(Name, Scope, Options)
 	end
 end
@@ -461,10 +461,10 @@ function MockDataStore.Unject() : ()
 	if InjectionCount == 0 then
 		local DataStoreService = game:GetService("DataStoreService")
 		if OriginalGetDataStore then
-			(DataStoreService :: any).GetDataStore = OriginalGetDataStore
+			;(DataStoreService :: any).GetDataStore = OriginalGetDataStore
 		end
 		if OriginalGetOrderedDataStore then
-			(DataStoreService :: any).GetOrderedDataStore = OriginalGetOrderedDataStore
+			;(DataStoreService :: any).GetOrderedDataStore = OriginalGetOrderedDataStore
 		end
 		MockDataStore.ClearRegistry()
 		table.clear(Faults)
