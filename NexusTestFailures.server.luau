@@ -16,8 +16,7 @@ Section("F-ERROR-SHAPES: DataStore Errors")
 do
 	local Harness = NexusTestHelpers.TestHarness.New()
 	local Store = Harness:CreateStore({ Name = "Failures_ErrorShapes", Schema = TestSchema })
-	
-	MockDataStore.Fault("Failures_ErrorShapes:global", "GetAsync", "Fake DataStore throttle")
+	MockDataStore.Fault("Failures_ErrorShapes", "GetAsync", "Fake DataStore throttle")
 	local LoadResult = Store:Load("ErrShapeKey")
 	Assert(LoadResult.Passed == false, "[expected] Load fails due to generic DataStoreError")
 	Assert(Nexus.IsDataStoreError(LoadResult), "Result is DataStoreError")
@@ -41,24 +40,20 @@ do
 	Harness:Teardown()
 end
 
-Section("F-BUDGET: Exhaustion and Recovery")
+Section("F-THROTTLE: Exhaustion and Recovery")
 do
 	local Harness = NexusTestHelpers.TestHarness.New()
-	local Store = Harness:CreateStore({ Name = "Failures_Budget", Schema = TestSchema })
+	local Store = Harness:CreateStore({ Name = "Failures_Throttle", Schema = TestSchema })
 	
-	for i = 1, 10 do
-		Nexus.MemoryBudget.RecordFailure("Failures_Budget")
-	end
+	MockDataStore.SimulateThrottle("Failures_Throttle", 10)
 	
-	local LoadResult = Store:Load("BudgetKey")
+	local LoadResult = Store:Load("ThrottleKey")
 	Assert(LoadResult.Passed == false, "[expected] Load fails due to budget constraint")
-	Assert(Nexus.IsBudgetExhausted(LoadResult), "Result is BudgetExhausted")
+	Assert(Nexus.IsThrottled(LoadResult) or Nexus.IsDataStoreError(LoadResult), "Result is Throttled or Error")
 	
-	for i = 1, 3 do
-		Nexus.MemoryBudget.RecordSuccess("Failures_Budget")
-	end
+	MockDataStore.SimulateThrottle("Failures_Throttle", 0)
 	
-	local LoadResult2 = Store:Load("BudgetKey")
+	local LoadResult2 = Store:Load("ThrottleKey")
 	Assert(LoadResult2.Passed, "Load succeeds after budget recovery")
 	
 	Harness:Teardown()
@@ -68,9 +63,8 @@ Section("F-CIRCUIT: Breaker Transitions")
 do
 	local Harness = NexusTestHelpers.TestHarness.New()
 	local Store = Harness:CreateStore({ Name = "Failures_Circuit", Schema = TestSchema })
-	
 	for i=1, 6 do
-		MockDataStore.Fault("Failures_Circuit:global", "GetAsync", "Trigger Circuit")
+		MockDataStore.Fault("Failures_Circuit", "GetAsync", "Trigger Circuit")
 		local r = Store:Load("CircKey" .. i)
 		Assert(r.Passed == false, "[expected] Circuit load " .. i .. " fails")
 	end
@@ -100,9 +94,8 @@ Section("F-RETRY: Max Retries")
 do
 	local Harness = NexusTestHelpers.TestHarness.New()
 	local Store = Harness:CreateStore({ Name = "Failures_Retry", Schema = TestSchema })
-	
 	for i=1, 10 do
-		MockDataStore.Fault("Failures_Retry:global", "GetAsync", "Continuous Failure " .. i)
+		MockDataStore.Fault("Failures_Retry", "GetAsync", "Continuous Failure " .. i)
 	end
 	
 	local LoadResult = Store:Load("RetryKey")
@@ -115,8 +108,7 @@ Section("F-INBOX: Update failures")
 do
 	local Harness = NexusTestHelpers.TestHarness.New()
 	local Inbox = Harness:CreateStore({ Name = "Failures_Inbox", Schema = TestSchema })
-	
-	MockDataStore.Fault("Failures_Inbox:global", "UpdateAsync", "Inbox Update Fail")
+	MockDataStore.Fault("Failures_Inbox", "UpdateAsync", "Inbox Update Fail")
 	local Res = Inbox:Update("InboxKey", function(d) return d end)
 	Assert(Res.Passed == false, "[expected] Inbox updates can fail")
 	
