@@ -156,7 +156,9 @@ function MemoryBudget.Reset(Resource : string?) : ()
 			for _QueueKey, Queue in ExistingBucket.Queues do
 				while #Queue > 0 do
 					local QueueEntry = table.remove(Queue, 1) :: QueuedOperation
-					task.spawn(QueueEntry.Thread, false)
+					if coroutine.status(QueueEntry.Thread) == "suspended" then
+						task.spawn(QueueEntry.Thread, false)
+					end
 				end
 			end
 		end
@@ -183,6 +185,7 @@ function MemoryBudget._EnsureDrainer(Resource : string) : ()
 
 				while #Queue > 0 and not IsInBackoff(Bucket) do
 					local QueueEntry = table.remove(Queue, 1) :: QueuedOperation
+					if coroutine.status(QueueEntry.Thread) ~= "suspended" then continue end
 					if CurrentTime - QueueEntry.EnqueuedAt > MAXIMUM_QUEUE_WAIT then
 						task.spawn(QueueEntry.Thread, false)
 					else
@@ -194,7 +197,9 @@ function MemoryBudget._EnsureDrainer(Resource : string) : ()
 				while Index <= #Queue do
 					if CurrentTime - Queue[Index].EnqueuedAt > MAXIMUM_QUEUE_WAIT then
 						local TimedOutEntry = table.remove(Queue, Index) :: QueuedOperation
-						task.spawn(TimedOutEntry.Thread, false)
+						if coroutine.status(TimedOutEntry.Thread) == "suspended" then
+							task.spawn(TimedOutEntry.Thread, false)
+						end
 					else
 						Index += 1
 					end

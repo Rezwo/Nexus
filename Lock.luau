@@ -54,6 +54,7 @@ export type LockManager = typeof(setmetatable({} :: {
 	_StoreName : string,
 	_ActiveHeartbeats : { [string] : thread },
 	_ActiveLeases : { [string] : Lease },
+	_HeartbeatGeneration : { [string] : number },
 	_Circuit : Circuit.CircuitBreaker,
 	_LeaseTimeToLive : number,
 	_HeartbeatInterval : number,
@@ -78,6 +79,7 @@ function Lock.New(StoreName : string, Configuration : LockConfiguration?) : Lock
 	self._StoreName = StoreName
 	self._ActiveHeartbeats = {}
 	self._ActiveLeases = {}
+	self._HeartbeatGeneration = {}
 	self._LeaseTimeToLive = Config.LeaseTimeToLive or DEFAULT_LEASE_TIME_TO_LIVE
 	self._HeartbeatInterval = Config.HeartbeatInterval or DEFAULT_HEARTBEAT_INTERVAL
 	self._EnvelopeLeaseTimeToLive = Config.EnvelopeLeaseTimeToLive or DEFAULT_ENVELOPE_LEASE_TIME_TO_LIVE
@@ -415,9 +417,18 @@ end
 function Lock._StartHeartbeat(self : LockManager, Key : string) : ()
 	self:_StopHeartbeat(Key)
 
+	-- Increment generation so any stale heartbeat thread that resumes after
+	-- task.cancel (possible while its UpdateAsync call is in-flight) can detect
+	-- it no longer owns this lease and bail without touching remote state.
+	local Gen = (self._HeartbeatGeneration[Key] or 0) + 1
+	self._HeartbeatGeneration[Key] = Gen
+
 	local HeartbeatThread = task.spawn(function()
 		while true do
 			task.wait(self._HeartbeatInterval)
+
+			-- Bail if generation has advanced (Released or re-Acquired).
+			if self._HeartbeatGeneration[Key] ~= Gen then break end
 
 			local ActiveLease = self._ActiveLeases[Key]
 			if not ActiveLease then
@@ -434,20 +445,31 @@ function Lock._StartHeartbeat(self : LockManager, Key : string) : ()
 				local CallStartTime = os.clock()
 				local RenewalSuccess, RenewalError = pcall(function() : string?
 					self._HashMap:UpdateAsync(Key, function(Existing : { [string] : unknown }?)
+						-- Re-check generation INSIDE the callback: task.cancel may have fired
+						-- between the yield and the callback executing.
+						if self._HeartbeatGeneration[Key] ~= Gen then
+							return Existing  -- leave remote state untouched
+						end
+
+						local CurrentActiveLease = self._ActiveLeases[Key]
+						if CurrentActiveLease == nil then
+							return Existing  -- released while async call was in-flight
+						end
+
 						if Existing == nil then
-							ActiveLease.ExpiresAt = CurrentTime + self._LeaseTimeToLive
-							ActiveLease.RenewedAt = CurrentTime
-							ActiveLease.LeaseVersion += 1
-							return ActiveLease :: any
+							CurrentActiveLease.ExpiresAt = CurrentTime + self._LeaseTimeToLive
+							CurrentActiveLease.RenewedAt = CurrentTime
+							CurrentActiveLease.LeaseVersion += 1
+							return CurrentActiveLease :: any
 						end
 
 						local RemoteLease = (Existing :: any) :: Lease
 						if typeof(RemoteLease) ~= "table" or typeof(RemoteLease.JobId) ~= "string" then
 							-- Corrupt entry — reclaim it.
-							ActiveLease.ExpiresAt = CurrentTime + self._LeaseTimeToLive
-							ActiveLease.RenewedAt = CurrentTime
-							ActiveLease.LeaseVersion += 1
-							return ActiveLease :: any
+							CurrentActiveLease.ExpiresAt = CurrentTime + self._LeaseTimeToLive
+							CurrentActiveLease.RenewedAt = CurrentTime
+							CurrentActiveLease.LeaseVersion += 1
+							return CurrentActiveLease :: any
 						end
 
 						if RemoteLease.JobId ~= SERVER_JOB_ID then
@@ -457,14 +479,14 @@ function Lock._StartHeartbeat(self : LockManager, Key : string) : ()
 							return Existing
 						end
 
-						if RemoteLease.LeaseVersion > ActiveLease.LeaseVersion then
-							ActiveLease.LeaseVersion = RemoteLease.LeaseVersion
+						if RemoteLease.LeaseVersion > CurrentActiveLease.LeaseVersion then
+							CurrentActiveLease.LeaseVersion = RemoteLease.LeaseVersion
 						end
 
-						ActiveLease.ExpiresAt = CurrentTime + self._LeaseTimeToLive
-						ActiveLease.RenewedAt = CurrentTime
-						ActiveLease.LeaseVersion += 1
-						return ActiveLease :: any
+						CurrentActiveLease.ExpiresAt = CurrentTime + self._LeaseTimeToLive
+						CurrentActiveLease.RenewedAt = CurrentTime
+						CurrentActiveLease.LeaseVersion += 1
+						return CurrentActiveLease :: any
 					end, self._LeaseTimeToLive)
 					return nil
 				end)
@@ -484,6 +506,9 @@ function Lock._StartHeartbeat(self : LockManager, Key : string) : ()
 				end
 			end
 
+			-- Final generation check after the async call returns.
+			if self._HeartbeatGeneration[Key] ~= Gen then break end
+
 			if LeaseWasStolen then
 				self._ActiveLeases[Key] = nil
 				if self._OnStolen and StealerJobId then
@@ -492,8 +517,10 @@ function Lock._StartHeartbeat(self : LockManager, Key : string) : ()
 				break
 			end
 
-			ActiveLease.RenewedAt = CurrentTime
-			self._ActiveLeases[Key] = ActiveLease
+			local CurrentActiveLease = self._ActiveLeases[Key]
+			if CurrentActiveLease then
+				CurrentActiveLease.RenewedAt = CurrentTime
+			end
 		end
 	end)
 

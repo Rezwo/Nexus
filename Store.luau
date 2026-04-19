@@ -18,6 +18,7 @@ local Messaging = require(script.Parent.Messaging)
 local Semaphore = require(script.Parent.Semaphore)
 local Telemetry = require(script.Parent.Telemetry)
 local MiddlewareModule = require(script.Parent.Middleware)
+local Budget = require(script.Parent.Budget)
 
 type Result<Value> = Types.Result<Value>
 type NexusError = Types.NexusError
@@ -173,6 +174,29 @@ function Store.New<DataType>(Configuration : StoreConfiguration<DataType>) : Sto
 	assert(Configuration.Schema, "Schema definition is required")
 	assert(Configuration.Schema.Version >= 1, "Schema version must be >= 1")
 	assert(Configuration.Schema.Default ~= nil, "Schema default is required")
+
+	-- Validate migration chain covers every version from 2 → Schema.Version
+	-- with no gaps or duplicates, so runtime migration can never silently skip
+	-- a step.
+	if Configuration.Schema.Version > 1 then
+		local Migrations = Configuration.Schema.Migrations
+		assert(Migrations and #Migrations > 0,
+			`Schema version is {Configuration.Schema.Version} but no migration steps are defined`)
+		local CoveredVersions : { [number] : boolean } = {}
+		for _, Step in Migrations do
+			assert(typeof(Step.Version) == "number" and Step.Version >= 2,
+				`Migration step version must be >= 2, got '{tostring(Step.Version)}'`)
+			assert(typeof(Step.Up) == "function",
+				`Migration step for version {Step.Version} must have an 'Up' function`)
+			assert(not CoveredVersions[Step.Version],
+				`Duplicate migration step for version {Step.Version}`)
+			CoveredVersions[Step.Version] = true
+		end
+		for V = 2, Configuration.Schema.Version do
+			assert(CoveredVersions[V],
+				`Schema migration chain is missing step for version {V} (schema version is {Configuration.Schema.Version})`)
+		end
+	end
 
 	local ResolvedConfiguration : StoreConfiguration<DataType> = {
 		Name = Configuration.Name,
@@ -389,7 +413,26 @@ function Store.Load<DataType>(self : StoreObject<DataType>, Key : string) : Resu
 
 	local UnpackResult = SessionModule.UnpackEnvelope(RawData, self._Configuration.Schema)
 	if not UnpackResult.Passed then
-		if self._LockManager then self._LockManager:Release(Key) end
+		if self._LockManager then
+			-- Release the MemoryStore lease so other servers can acquire.
+			self._LockManager:Release(Key)
+			-- Also stamp the envelope with a released lock so the disk entry
+			-- doesn't block future loads for EnvelopeLeaseTimeToLive seconds.
+			if RawData ~= nil and typeof(RawData) == "table" then
+				local UnlockEnvelope = table.clone(RawData :: any) :: any
+				UnlockEnvelope._lock = Lock.ToReleasedLockInfo()
+				task.spawn(function()
+					pcall(function()
+						self._DataStore:UpdateAsync(Key, function(CurrentRemote : unknown)
+							if typeof(CurrentRemote) ~= "table" then return nil end
+							local Patched = table.clone(CurrentRemote :: any)
+							Patched._lock = Lock.ToReleasedLockInfo()
+							return Patched
+						end)
+					end)
+				end)
+			end
+		end
 		local UnpackError = (UnpackResult :: Types.ErrorResult).Error
 		UnpackError.Key = Key
 		self.OnError:Fire(Key, UnpackError)
@@ -555,8 +598,13 @@ function Store.Read<DataType>(self : StoreObject<DataType>, Key : string) : Resu
 	if not TargetSession then
 		return Errors.Fail(Errors.New("SessionNotFound", `No active session for key '{Key}'`, { Key = Key }))
 	end
-	self:_TouchActivity(Key)
-	return TargetSession:Read()
+	local ReadResult = TargetSession:Read()
+	-- Only update activity if the read actually succeeded (P2-10: don't
+	-- mark a dead/error session as active to avoid suppressing OnIdle).
+	if ReadResult.Passed then
+		self:_TouchActivity(Key)
+	end
+	return ReadResult
 end
 
 function Store.Update<DataType>(
@@ -727,6 +775,7 @@ function Store._FinalizeSave<DataType>(
 
 	TargetSession:SetStatus("Active")
 	TargetSession:MarkSaved()
+	self:_TouchActivity(Key)
 	self:_RecordAudit(Key, "Save", Validation.DeepClone(TargetSession._Data), TargetSession._Data)
 	self:_FlushAuditLog(Key)
 
@@ -868,8 +917,9 @@ end
 
 function Store._StartAutoSave<DataType>(self : StoreObject<DataType>) : ()
 	self._AutoSaveThread = task.spawn(function()
-		while true do
+		while not self._ShuttingDown do
 			task.wait(self._Configuration.AutoSaveInterval or 300)
+			if self._ShuttingDown then break end
 			self:SaveAll()
 		end
 	end)
@@ -901,6 +951,27 @@ function Store._StartIdleTracker<DataType>(self : StoreObject<DataType>) : ()
 					IdleFired[Key] = nil
 				end
 			end
+
+			-- Sweep expired soft-deleted entries and purge them from disk so the
+			-- DataStore key doesn't stay permanently tombstoned past retention.
+			local RetentionPeriod = self._Configuration.SoftDeleteRetention
+			if RetentionPeriod and RetentionPeriod > 0 then
+				local ExpiredKeys : { string } = {}
+				local Now = os.time()
+				for SoftKey, Entry in self._SoftDeleted do
+					if Now - Entry.DeletedAt >= RetentionPeriod then
+						table.insert(ExpiredKeys, SoftKey)
+					end
+				end
+				for _, SoftKey in ExpiredKeys do
+					task.spawn(function()
+						local PurgeResult = self:PurgeSoftDeleted(SoftKey)
+						if not PurgeResult.Passed then
+							warn(`[Nexus] Soft-delete expiry purge failed for '{SoftKey}': {(PurgeResult :: Types.ErrorResult).Error.Message}`)
+						end
+					end)
+				end
+			end
 		end
 	end)
 end
@@ -908,6 +979,12 @@ end
 function Store.SaveAll<DataType>(self : StoreObject<DataType>) : ()
 	for Key, TargetSession in self._Sessions do
 		if TargetSession:IsDirty() and TargetSession._Status == "Active" then
+			if not Budget.HasCapacity("UpdateAsync") then
+				-- Budget is exhausted; skip this key this cycle. The next auto-save
+				-- interval will retry. This prevents auto-save from queuing writes
+				-- that would immediately block for up to MAXIMUM_QUEUE_WAIT seconds.
+				continue
+			end
 			local SaveResult = self:Save(Key)
 			if not SaveResult.Passed then
 				warn(`[Nexus] Auto-save failed for '{Key}': {(SaveResult :: Types.ErrorResult).Error.Message}`)
@@ -1022,6 +1099,20 @@ function Store._WriteEnvelopeInner<DataType>(
 		return Errors.Passed(true)
 	end
 
+	-- Pre-write size guard: reject obviously over-limit payloads before spending
+	-- a DataStore API call that will fail with a quota error anyway.
+	local PayloadForSize = WriteEnvelope._d
+	local EstimatedPayloadSize = if typeof(PayloadForSize) == "string"
+		then #(PayloadForSize :: string)
+		else Compression.EstimateSize(PayloadForSize :: any)
+	if EstimatedPayloadSize > 4_000_000 then
+		local SizeError = Errors.New("ValidationFailed",
+			`Payload for key '{Key}' is {EstimatedPayloadSize} bytes, exceeding the 4 MB DataStore limit. Enable Compress or ShardThreshold.`,
+			{ Key = Key })
+		self._Telemetry:Record("Store.Write.SizeRejected", 0, false, SizeError)
+		return Errors.Fail(SizeError)
+	end
+
 	local SaveResult = Retry.WrapPcall("DataStoreError", function()
 		self._DataStore:UpdateAsync(Key, function(CurrentRemote : unknown)
 			-- Inherit and increment the remote transaction version.
@@ -1116,13 +1207,22 @@ function Store.SaveOptimistic<DataType>(self : StoreObject<DataType>, Key : stri
 			local PayloadData : DataType | string = ReplayedData
 			local IsCompressed = false
 			if ShouldCompress then
+				-- TryCompress does a single JSON encode for both size estimation and
+				-- compression, avoiding the double-encode of EstimateSize + Compress.
+				local Compressed, WasCompressed, JsonSize = Compression.TryCompress(
+					ReplayedData :: any, CompressionThreshold, CompressionLevel)
+				if WasCompressed then
+					PayloadData = Compressed :: any
+					IsCompressed = true
+				elseif JsonSize > 4_000_000 then
+					warn(`[Nexus] SaveOptimistic: payload ({JsonSize} bytes) exceeds 4 MB for '{Key}'. Aborting commit.`)
+					return nil
+				end
+			else
 				local EstimatedSize = Compression.EstimateSize(ReplayedData :: any)
-				if EstimatedSize > CompressionThreshold then
-					local CompressResult = Compression.Compress(ReplayedData :: any, CompressionLevel)
-					if CompressResult.Passed then
-						PayloadData = (CompressResult :: Types.SuccessResult<string>).Value :: any
-						IsCompressed = true
-					end
+				if EstimatedSize > 4_000_000 then
+					warn(`[Nexus] SaveOptimistic: uncompressed payload ({EstimatedSize} bytes) exceeds 4 MB for '{Key}'. Aborting commit.`)
+					return nil
 				end
 			end
 
@@ -1158,12 +1258,16 @@ function Store.SaveOptimistic<DataType>(self : StoreObject<DataType>, Key : stri
 	end
 
 	local CurrentActions = TargetSession._PendingActions
-	if #CurrentActions > ReplayedActionCount then
+	local HasSurvivors = #CurrentActions > ReplayedActionCount
+	if HasSurvivors then
 		local SurvivorActions : { (Data : DataType) -> DataType? } = {}
 		for Index = ReplayedActionCount + 1, #CurrentActions do
 			table.insert(SurvivorActions, CurrentActions[Index])
 		end
 		TargetSession._PendingActions = SurvivorActions
+		-- Survivors mean the session still has uncommitted actions on disk;
+		-- keep it dirty so the next save cycle picks them up.
+		TargetSession._Dirty = true
 	else
 		TargetSession._PendingActions = {}
 		TargetSession._Dirty = false
@@ -1171,7 +1275,16 @@ function Store.SaveOptimistic<DataType>(self : StoreObject<DataType>, Key : stri
 	TargetSession._LastSaveTime = os.clock()
 	TargetSession._SaveCount += 1
 	TargetSession._Status = "Active" :: SessionStatus
-	TargetSession.OnSave:Fire(TargetSession._Data)
+	self:_TouchActivity(Key)
+
+	-- Only fire OnSave when the full pending set was committed. With survivors
+	-- outstanding, callers that rely on OnSave meaning "all data durable" would
+	-- be misled.
+	if not HasSurvivors then
+		TargetSession.OnSave:Fire(TargetSession._Data)
+		self.OnSave:Fire(Key, TargetSession._Data)
+		if self._Callbacks.OnSave then self._Callbacks.OnSave(Key, TargetSession._Data) end
+	end
 
 	return Errors.Passed(true)
 end
@@ -1238,13 +1351,11 @@ function Store._CommitParticipantCAS<DataType>(
 			local PayloadData : DataType | string = TransformedData
 			local IsCompressed = false
 			if ShouldCompress then
-				local EstimatedSize = Compression.EstimateSize(TransformedData :: any)
-				if EstimatedSize > CompressionThreshold then
-					local CompressResult = Compression.Compress(TransformedData :: any, CompressionLevel)
-					if CompressResult.Passed then
-						PayloadData = (CompressResult :: Types.SuccessResult<string>).Value :: any
-						IsCompressed = true
-					end
+				local Compressed, WasCompressed, _ = Compression.TryCompress(
+					TransformedData :: any, CompressionThreshold, CompressionLevel)
+				if WasCompressed then
+					PayloadData = Compressed :: any
+					IsCompressed = true
 				end
 			end
 
@@ -1313,6 +1424,44 @@ function Store.Transact<DataType>(
 		local ConflictDetected = false
 		local HardError : NexusError? = nil
 
+		local function RollbackCommittedKeys(FailedKey : string) : { Types.TransactionRollbackStatus }
+			local RollbackStatuses : { Types.TransactionRollbackStatus } = {}
+			for _, CommittedKey in CommittedKeys do
+				if CommittedKey == FailedKey then continue end
+				local RollbackSession = self._Sessions[CommittedKey]
+				local Snapshot = ParticipantSnapshots[CommittedKey]
+				if not RollbackSession or not Snapshot then continue end
+
+				-- Restore in-memory state immediately.
+				RollbackSession._Data = Snapshot.Data
+				RollbackSession._Dirty = true
+
+				-- Persist the snapshot directly; bypass debounce so the rollback
+				-- hits disk before this function returns, and capture failure.
+				local RollbackEnvelopeResult = RollbackSession:BuildEnvelope()
+				if RollbackEnvelopeResult.Passed then
+					local RollbackEnvelope = (RollbackEnvelopeResult :: Types.SuccessResult<Envelope<DataType>>).Value
+					if self._LockManager then
+						local LockInfo = self._LockManager:ToLockInfo(CommittedKey)
+						if LockInfo then RollbackEnvelope._lock = LockInfo end
+					end
+					local PersistResult = self:_WriteEnvelope(CommittedKey, RollbackEnvelope, RollbackSession:GetUserIds())
+					if PersistResult.Passed then
+						RollbackSession:MarkSaved()
+						table.insert(RollbackStatuses, { Key = CommittedKey, Succeeded = true, Error = nil } :: Types.TransactionRollbackStatus)
+					else
+						local PersistError = (PersistResult :: Types.ErrorResult).Error
+						warn(`[Nexus] Transact: rollback persist failed for '{CommittedKey}': {PersistError.Message}`)
+						table.insert(RollbackStatuses, { Key = CommittedKey, Succeeded = false, Error = PersistError } :: Types.TransactionRollbackStatus)
+					end
+				else
+					local EnvError = (RollbackEnvelopeResult :: Types.ErrorResult).Error
+					table.insert(RollbackStatuses, { Key = CommittedKey, Succeeded = false, Error = EnvError } :: Types.TransactionRollbackStatus)
+				end
+			end
+			return RollbackStatuses
+		end
+
 		for _, ParticipantEntry in Participants do
 			local ParticipantSnapshot = ParticipantSnapshots[ParticipantEntry.Key]
 			local ParticipantUserIds = self._Sessions[ParticipantEntry.Key]:GetUserIds()
@@ -1325,29 +1474,22 @@ function Store.Transact<DataType>(
 
 			if not CommitResult.Passed then
 				HardError = (CommitResult :: Types.ErrorResult).Error
-
-				for _, CommittedKey in CommittedKeys do
-					local RollbackSession = self._Sessions[CommittedKey]
-					if RollbackSession then
-						RollbackSession._Data = ParticipantSnapshots[CommittedKey].Data
-						RollbackSession._Dirty = true
-						self:_PerformDebouncedSave(CommittedKey)
-					end
-				end
-				return { Passed = false, Error = HardError, Results = Results }
+				local Rollbacks = RollbackCommittedKeys(ParticipantEntry.Key)
+				local AnyFailed = false
+				for _, R in Rollbacks do if not R.Succeeded then AnyFailed = true end end
+				return {
+					Passed = false,
+					Error = HardError,
+					Results = Results,
+					Rollbacks = if #Rollbacks > 0 then Rollbacks else nil,
+					PartiallyCommitted = AnyFailed,
+				}
 			end
 
 			local DidCommit = (CommitResult :: Types.SuccessResult<boolean>).Value
 			if not DidCommit then
 				ConflictDetected = true
-				for _, CommittedKey in CommittedKeys do
-					local RollbackSession = self._Sessions[CommittedKey]
-					if RollbackSession then
-						RollbackSession._Data = ParticipantSnapshots[CommittedKey].Data
-						RollbackSession._Dirty = true
-						self:_PerformDebouncedSave(CommittedKey)
-					end
-				end
+				RollbackCommittedKeys(ParticipantEntry.Key)
 				break
 			end
 
@@ -1370,7 +1512,7 @@ function Store.Transact<DataType>(
 							if typeof(RawData) == "table" then
 								local RemoteTable = RawData :: any
 								self._LastKnownTxv[ParticipantEntry.Key] = typeof(RemoteTable._txv) == "number" and RemoteTable._txv or 0
-								end
+							end
 						end
 					end
 				end
@@ -1378,10 +1520,13 @@ function Store.Transact<DataType>(
 			continue
 		end
 
+		-- All participants committed. Sync local sessions to what was actually
+		-- written (remote-transformed data), not a re-application of the
+		-- transform against local stale state (P2-5 fix).
 		for _, ParticipantEntry in Participants do
 			local TargetSession = self._Sessions[ParticipantEntry.Key]
 			if TargetSession then
-				local TransformedData = ParticipantEntry.Transform(Validation.DeepClone(TargetSession._Data))
+				local TransformedData = ParticipantEntry.Transform(Validation.DeepClone(ParticipantSnapshots[ParticipantEntry.Key].Data))
 				if TransformedData ~= nil then
 					TargetSession._Data = TransformedData
 					TargetSession._Dirty = false
@@ -1389,7 +1534,7 @@ function Store.Transact<DataType>(
 			end
 		end
 
-		return { Passed = true, Results = Results }
+		return { Passed = true, Results = Results, Rollbacks = nil, PartiallyCommitted = false }
 	end
 
 	return {
@@ -1397,6 +1542,8 @@ function Store.Transact<DataType>(
 		Error = Errors.New("TransactionConflict",
 			`Transaction failed after {MaxRetryCount} CAS retries`),
 		Results = Results,
+		Rollbacks = nil,
+		PartiallyCommitted = false,
 	}
 end
 
@@ -1432,12 +1579,16 @@ function Store.ListVersions<DataType>(self : StoreObject<DataType>, Key : string
 end
 
 function Store.GetVersion<DataType>(self : StoreObject<DataType>, Key : string, VersionId : string) : Result<VersionEntry<DataType>>
+	local RawVersionData : unknown = nil
+	local VersionKeyInfo : DataStoreKeyInfo? = nil
 	local FetchResult = Retry.WrapPcall("DataStoreError", function()
-		return (self._DataStore :: DataStore):GetVersionAsync(Key, VersionId)
+		local Data, KeyInfo = (self._DataStore :: DataStore):GetVersionAsync(Key, VersionId)
+		RawVersionData = Data
+		VersionKeyInfo = KeyInfo
+		return Data
 	end, { MaxRetries = 3, BudgetType = "GetVersionAsync" } :: any)
 
 	if not FetchResult.Passed then return Errors.Fail((FetchResult :: Types.ErrorResult).Error) end
-	local RawVersionData = (FetchResult :: Types.SuccessResult<unknown>).Value
 
 	if typeof(RawVersionData) == "table" then
 		local VersionTable = RawVersionData :: any
@@ -1450,7 +1601,8 @@ function Store.GetVersion<DataType>(self : StoreObject<DataType>, Key : string, 
 	local UnpackResult = SessionModule.UnpackEnvelope(RawVersionData, self._Configuration.Schema)
 	if not UnpackResult.Passed then return Errors.Fail((UnpackResult :: Types.ErrorResult).Error) end
 	local UnpackedData = (UnpackResult :: Types.SuccessResult<{ Data : DataType, Version : number }>).Value
-	return Errors.Passed({ Version = VersionId, CreatedTime = 0, Data = UnpackedData.Data, IsDeleted = RawVersionData == nil })
+	local CreatedTime = if VersionKeyInfo ~= nil then (VersionKeyInfo :: any).CreatedTime or 0 else 0
+	return Errors.Passed({ Version = VersionId, CreatedTime = CreatedTime, Data = UnpackedData.Data, IsDeleted = RawVersionData == nil })
 end
 
 function Store.Rollback<DataType>(self : StoreObject<DataType>, Key : string, VersionId : string) : Result<DataType>
@@ -1470,7 +1622,9 @@ function Store.Rollback<DataType>(self : StoreObject<DataType>, Key : string, Ve
 	end
 
 	if (self._ShardCounts[Key] or 0) == 0 then
-		local PeekSuccess, PeekData = pcall(function() return self._DataStore:GetAsync(Key) end)
+		local PeekResult = Retry.WrapPcall("DataStoreError", function() return self._DataStore:GetAsync(Key) end, { MaxRetries = 1, BudgetType = "GetAsync" } :: any)
+		local PeekSuccess = PeekResult.Passed
+		local PeekData = if PeekSuccess then (PeekResult :: Types.SuccessResult<unknown>).Value else nil
 		if PeekSuccess and typeof(PeekData) == "table" then
 			local MaybeShard = (PeekData :: any)._s
 			if typeof(MaybeShard) == "number" and MaybeShard > 0 then self._ShardCounts[Key] = MaybeShard end
@@ -1952,7 +2106,9 @@ function Store.Remove<DataType>(self : StoreObject<DataType>, Key : string) : Re
 
 	local ShardCount = self._ShardCounts[Key] or 0
 	if ShardCount == 0 then
-		local PeekSuccess, PeekData = pcall(function() return self._DataStore:GetAsync(Key) end)
+		local PeekResult = Retry.WrapPcall("DataStoreError", function() return self._DataStore:GetAsync(Key) end, { MaxRetries = 1, BudgetType = "GetAsync" } :: any)
+		local PeekSuccess = PeekResult.Passed
+		local PeekData = if PeekSuccess then (PeekResult :: Types.SuccessResult<unknown>).Value else nil
 		if PeekSuccess and typeof(PeekData) == "table" then
 			local MaybeShard = (PeekData :: any)._s
 			if typeof(MaybeShard) == "number" and MaybeShard > 0 then ShardCount = MaybeShard end
@@ -1983,6 +2139,7 @@ function Store.Remove<DataType>(self : StoreObject<DataType>, Key : string) : Re
 end
 
 function Store.Destroy<DataType>(self : StoreObject<DataType>) : ()
+	self._ShuttingDown = true
 	self:CloseAll()
 	if self._IdleThread then task.cancel(self._IdleThread); self._IdleThread = nil end
 	for Key, Thread in self._DebounceTimers do
