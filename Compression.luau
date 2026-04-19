@@ -11,6 +11,17 @@ type Result<Value> = Types.Result<Value>
 local Compression = {}
 
 local DEFAULT_COMPRESSION_LEVEL = 3
+local MIN_COMPRESSION_LEVEL = 1
+local MAX_COMPRESSION_LEVEL = 22
+
+local function ResolveLevel(Requested : number?) : number
+	if Requested == nil then return DEFAULT_COMPRESSION_LEVEL end
+	if typeof(Requested) ~= "number" or Requested ~= Requested then
+		return DEFAULT_COMPRESSION_LEVEL
+	end
+	local Clamped = math.clamp(math.floor(Requested), MIN_COMPRESSION_LEVEL, MAX_COMPRESSION_LEVEL)
+	return Clamped
+end
 
 function Compression.Compress(
 	Data : { [string] : unknown },
@@ -21,7 +32,7 @@ function Compression.Compress(
 		return Errors.Fail(Errors.New("CompressionError", `Failed to JSON-encode: {JsonString}`))
 	end
 
-	local Level = CompressionLevel or DEFAULT_COMPRESSION_LEVEL
+	local Level = ResolveLevel(CompressionLevel)
 	local InputBuffer = buffer.fromstring(JsonString :: string)
 
 	local CompressSuccess, CompressedBuffer = pcall(function()
@@ -45,7 +56,7 @@ function Compression.CompressString(
 	JsonString : string,
 	CompressionLevel : number?
 ) : Result<string>
-	local Level = CompressionLevel or DEFAULT_COMPRESSION_LEVEL
+	local Level = ResolveLevel(CompressionLevel)
 	local InputBuffer = buffer.fromstring(JsonString)
 
 	local CompressSuccess, CompressedBuffer = pcall(function()

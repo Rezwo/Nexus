@@ -53,6 +53,7 @@ local DEFAULT_IDLE_THRESHOLD = 600
 local DEFAULT_AUDIT_LOG_SIZE = 50
 local DEFAULT_AUDIT_SHARD_THRESHOLD = 3_500_000
 local DEFAULT_SOFT_DELETE_RETENTION = 2592000
+local DEFAULT_CLOSE_SAVE_MAX_RETRIES = 3
 
 local HttpService = game:GetService("HttpService")
 
@@ -201,6 +202,9 @@ function Store.New<DataType>(Configuration : StoreConfiguration<DataType>) : Sto
 		IdleTimeout = Configuration.IdleTimeout or DEFAULT_IDLE_THRESHOLD,
 		IdleCheckInterval = Configuration.IdleCheckInterval
 			or (if Configuration.IdleTimeout then math.max(Configuration.IdleTimeout / 2, 0.1) else 60),
+		WriteCooldown = Configuration.WriteCooldown or WRITE_COOLDOWN,
+		ReadOnly = Configuration.ReadOnly or false,
+		CloseSaveMaxRetries = Configuration.CloseSaveMaxRetries or DEFAULT_CLOSE_SAVE_MAX_RETRIES,
 	}
 
 	self._Configuration = ResolvedConfiguration
@@ -302,6 +306,10 @@ end
 function Store.Load<DataType>(self : StoreObject<DataType>, Key : string) : Result<DataType>
 	local StartTime = os.clock()
 	self:_DebugLog("Load.Start", Key)
+	if self._Configuration.ReadOnly then
+		return Errors.Fail(Errors.New("Internal",
+			`Store '{self._Configuration.Name}' is read-only; Load acquires a lock and is not permitted`, { Key = Key }))
+	end
 
 	if self._Sessions[Key] then
 		local ExistingSession = self._Sessions[Key]
@@ -411,7 +419,14 @@ function Store.Load<DataType>(self : StoreObject<DataType>, Key : string) : Resu
 	end
 
 	if self._Middleware:HasMiddleware("load") then
-		local MiddlewareResult = self._Middleware:Run("load", Key, LoadedData)
+		local MiddlewareOk, MiddlewareResult = self._Middleware:RunSafe("load", Key, LoadedData)
+		if not MiddlewareOk then
+			if self._LockManager then self._LockManager:Release(Key) end
+			local MwError = Errors.New("Internal",
+				`Load middleware threw for key '{Key}': {tostring(MiddlewareResult)}`, { Key = Key })
+			self._Telemetry:Record("Store.Load", os.clock() - StartTime, false, MwError)
+			return Errors.Fail(MwError)
+		end
 		if MiddlewareResult ~= nil then
 			LoadedData = MiddlewareResult :: DataType
 		end
@@ -549,6 +564,10 @@ function Store.Update<DataType>(
 	Key : string,
 	Transform : (Data : DataType) -> DataType?
 ) : Result<DataType>
+	if self._Configuration.ReadOnly then
+		return Errors.Fail(Errors.New("Internal",
+			`Store '{self._Configuration.Name}' is read-only; writes are not permitted`, { Key = Key }))
+	end
 	local TargetSession = self._Sessions[Key]
 	if not TargetSession then
 		return Errors.Fail(Errors.New("SessionNotFound", `No active session for key '{Key}'`, { Key = Key }))
@@ -683,7 +702,15 @@ function Store._FinalizeSave<DataType>(
 	MiddlewareData : DataType
 ) : Result<boolean>
 	if self._Middleware:HasMiddleware("save") then
-		self._Middleware:Run("save", Key, MiddlewareData)
+		local MiddlewareOk, MiddlewareResult = self._Middleware:RunSafe("save", Key, MiddlewareData)
+		if not MiddlewareOk then
+			TargetSession:SetStatus("Active")
+			local MwError = Errors.New("Internal",
+				`Save middleware threw for key '{Key}': {tostring(MiddlewareResult)}`, { Key = Key })
+			self.OnError:Fire(Key, MwError)
+			if self._Callbacks.OnError then self._Callbacks.OnError(Key, MwError) end
+			return Errors.Fail(MwError)
+		end
 	end
 
 	local WriteResult = self:_WriteEnvelope(Key, SaveEnvelope, UserIds)
@@ -757,7 +784,7 @@ function Store._PerformCloseSave<DataType>(
 ) : ()
 	local EnvelopeResult = TargetSession:BuildEnvelope()
 	if not EnvelopeResult.Passed then
-		warn(`[Nexus] Close-save envelope build failed for '{Key}'`)
+		warn(`[Nexus] Close-save envelope build failed for '{Key}': {(EnvelopeResult :: Types.ErrorResult).Error.Message}`)
 		return
 	end
 
@@ -772,11 +799,30 @@ function Store._PerformCloseSave<DataType>(
 		self:_WaitForWriteCooldown(Key)
 	end
 
-	local WriteResult = self:_WriteEnvelope(Key, CloseEnvelope, UserIds)
-	self._LastWriteTime[Key] = os.clock()
+	local MaxAttempts = self._Configuration.CloseSaveMaxRetries or DEFAULT_CLOSE_SAVE_MAX_RETRIES
+	local Delay = 1
+	local WriteResult : Result<boolean>? = nil
 
-	if not WriteResult.Passed then
-		warn(`[Nexus] Close-save failed for '{Key}': {(WriteResult :: Types.ErrorResult).Error.Message}`)
+	for Attempt = 1, MaxAttempts do
+		WriteResult = self:_WriteEnvelope(Key, CloseEnvelope, UserIds)
+		self._LastWriteTime[Key] = os.clock()
+		if (WriteResult :: Result<boolean>).Passed then
+			break
+		end
+		if Attempt < MaxAttempts then
+			task.wait(Delay)
+			Delay = math.min(Delay * 2, 8)
+		end
+	end
+
+	if not (WriteResult :: Result<boolean>).Passed then
+		local WriteError = ((WriteResult :: any) :: Types.ErrorResult).Error
+		warn(`[Nexus] Close-save failed for '{Key}' after {MaxAttempts} attempts: {WriteError.Message}`)
+		-- Do NOT mark dirty=false — session is about to be destroyed anyway,
+		-- but leaving it dirty means audit flush is also skipped, preventing
+		-- a confusing "saved" audit entry for data that wasn't persisted.
+		self.OnError:Fire(Key, WriteError)
+		if self._Callbacks.OnError then self._Callbacks.OnError(Key, WriteError) end
 	else
 		TargetSession:MarkSaved()
 		self:_FlushAuditLog(Key)
@@ -848,6 +894,13 @@ function Store._StartIdleTracker<DataType>(self : StoreObject<DataType>) : ()
 					IdleFired[Key] = nil
 				end
 			end
+			-- Prune stale IdleFired entries for sessions that have since been
+			-- closed (removed from _LastActivity) to prevent unbounded growth.
+			for Key in IdleFired do
+				if self._LastActivity[Key] == nil then
+					IdleFired[Key] = nil
+				end
+			end
 		end
 	end)
 end
@@ -882,9 +935,10 @@ end
 function Store._WaitForWriteCooldown<DataType>(self : StoreObject<DataType>, Key : string) : ()
 	local LastWriteTimestamp = self._LastWriteTime[Key]
 	if LastWriteTimestamp then
+		local Cooldown = self._Configuration.WriteCooldown or WRITE_COOLDOWN
 		local ElapsedTime = os.clock() - LastWriteTimestamp
-		if ElapsedTime < WRITE_COOLDOWN then
-			task.wait(WRITE_COOLDOWN - ElapsedTime)
+		if ElapsedTime < Cooldown then
+			task.wait(Cooldown - ElapsedTime)
 		end
 	end
 end
@@ -1759,18 +1813,17 @@ function Store._FlushAuditLog<DataType>(self : StoreObject<DataType>, Key : stri
 
 		local ShardWriteResult = Shard.WriteShards(self._DataStore, AuditKey, Chunks, MaxRetries)
 		if not ShardWriteResult.Passed then
-			warn(`[Nexus] _FlushAuditLog: shard write failed for '{AuditKey}'`)
-			return
+			warn(`[Nexus] _FlushAuditLog: shard write failed for '{AuditKey}' — dirty flag preserved for retry`)
+			return  -- leave _AuditDirty[Key] = true so the next flush retries
 		end
-
 
 		local ManifestSuccess, ManifestError = pcall(function()
 			self._DataStore:SetAsync(AuditKey, { _s = NewShardCount })
 		end)
 		if not ManifestSuccess then
 			warn(`[Nexus] _FlushAuditLog: manifest SetAsync failed for '{AuditKey}': {ManifestError}`)
+			return  -- shards written but manifest failed; dirty flag stays for retry
 		end
-
 
 		if OldAuditShardCount > NewShardCount then
 			Shard.CleanupOrphanedShards(self._DataStore, AuditKey, OldAuditShardCount, NewShardCount)
@@ -1779,7 +1832,6 @@ function Store._FlushAuditLog<DataType>(self : StoreObject<DataType>, Key : stri
 		self._AuditShardCounts[Key] = NewShardCount
 		self:_DebugLog("AuditFlush.Sharded", Key)
 	else
-
 		local DirectSuccess, DirectError = pcall(function()
 			self._DataStore:SetAsync(AuditKey, {
 				_c = true,
@@ -1787,9 +1839,9 @@ function Store._FlushAuditLog<DataType>(self : StoreObject<DataType>, Key : stri
 			})
 		end)
 		if not DirectSuccess then
-			warn(`[Nexus] _FlushAuditLog: SetAsync failed for '{AuditKey}': {DirectError}`)
+			warn(`[Nexus] _FlushAuditLog: SetAsync failed for '{AuditKey}': {DirectError} — dirty flag preserved for retry`)
+			return  -- leave _AuditDirty[Key] = true so the next flush retries
 		end
-
 
 		if OldAuditShardCount > 0 then
 			Shard.DeleteAllShards(self._DataStore, AuditKey, OldAuditShardCount)
@@ -1799,6 +1851,7 @@ function Store._FlushAuditLog<DataType>(self : StoreObject<DataType>, Key : stri
 		self:_DebugLog("AuditFlush.Direct", Key)
 	end
 
+	-- Only clear dirty after a confirmed successful write.
 	self._AuditDirty[Key] = false
 end
 

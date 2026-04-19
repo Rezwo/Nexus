@@ -56,7 +56,7 @@ function Leaderboard.Set(
 		self._OrderedStore:SetAsync(Key, Value)
 		return true
 	end, {
-		MaxRetries = self._Configuration.MaxRetries or 3,
+		MaxRetries = (self._Configuration.MaxRetries and self._Configuration.MaxRetries > 0 and self._Configuration.MaxRetries) or 3,
 		BudgetType = "SetIncrementAsync",
 	} :: any)
 
@@ -76,7 +76,7 @@ function Leaderboard.Increment(
 	local IncrementResult = Retry.WrapPcall("DataStoreError", function()
 		return self._OrderedStore:IncrementAsync(Key, IncrementDelta)
 	end, {
-		MaxRetries = self._Configuration.MaxRetries or 3,
+		MaxRetries = (self._Configuration.MaxRetries and self._Configuration.MaxRetries > 0 and self._Configuration.MaxRetries) or 3,
 		BudgetType = "SetIncrementAsync",
 	} :: any)
 
@@ -96,7 +96,7 @@ function Leaderboard.Remove(
 		self._OrderedStore:RemoveAsync(Key)
 		return true
 	end, {
-		MaxRetries = self._Configuration.MaxRetries or 3,
+		MaxRetries = (self._Configuration.MaxRetries and self._Configuration.MaxRetries > 0 and self._Configuration.MaxRetries) or 3,
 		BudgetType = "SetIncrementAsync",
 	} :: any)
 
@@ -112,7 +112,7 @@ function Leaderboard.Get(
 	local GetResult = Retry.WrapPcall("DataStoreError", function()
 		return self._OrderedStore:GetAsync(Key)
 	end, {
-		MaxRetries = self._Configuration.MaxRetries or 3,
+		MaxRetries = (self._Configuration.MaxRetries and self._Configuration.MaxRetries > 0 and self._Configuration.MaxRetries) or 3,
 		BudgetType = "GetAsync",
 	} :: any)
 
@@ -138,7 +138,7 @@ function Leaderboard.GetTop(
 			self._SortDirection == Enum.SortDirection.Ascending, PageSize, MinValue, MaxValue
 		)
 	end, {
-		MaxRetries = self._Configuration.MaxRetries or 3,
+		MaxRetries = (self._Configuration.MaxRetries and self._Configuration.MaxRetries > 0 and self._Configuration.MaxRetries) or 3,
 		BudgetType = "GetSortedAsync",
 	} :: any)
 
@@ -198,7 +198,7 @@ function Leaderboard.GetRange(
 			self._SortDirection == Enum.SortDirection.Ascending, PageSize, MinValue, MaxValue
 		)
 	end, {
-		MaxRetries = self._Configuration.MaxRetries or 3,
+		MaxRetries = (self._Configuration.MaxRetries and self._Configuration.MaxRetries > 0 and self._Configuration.MaxRetries) or 3,
 		BudgetType = "GetSortedAsync",
 	} :: any)
 
@@ -233,7 +233,7 @@ function Leaderboard.GetRank(
 	local PagesResult = Retry.WrapPcall("DataStoreError", function()
 		return self._OrderedStore:GetSortedAsync(self._SortDirection == Enum.SortDirection.Ascending, 100)
 	end, {
-		MaxRetries = self._Configuration.MaxRetries or 3,
+		MaxRetries = (self._Configuration.MaxRetries and self._Configuration.MaxRetries > 0 and self._Configuration.MaxRetries) or 3,
 		BudgetType = "GetSortedAsync",
 	} :: any)
 

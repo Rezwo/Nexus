@@ -10,6 +10,42 @@ type NexusError = Types.NexusError
 
 local Validation = {}
 
+-- Types that DataStore JSON cannot represent; we fail loudly rather than let
+-- them round-trip as nil and silently destroy player data.
+local NON_SERIALIZABLE_TYPES : { [string] : true } = {
+	["Instance"] = true,
+	["userdata"] = true,
+	["function"] = true,
+	["thread"] = true,
+	["buffer"] = true,
+	["RBXScriptSignal"] = true,
+	["RBXScriptConnection"] = true,
+	["EnumItem"] = true,
+	["Enum"] = true,
+	["Enums"] = true,
+	-- Common Roblox datatypes: they encode to tables with metatables so
+	-- DataStore accepts them, but they decode back as plain tables and lose
+	-- identity. Refuse them outright to prevent silent data corruption.
+	["Vector3"] = true,
+	["Vector2"] = true,
+	["CFrame"] = true,
+	["Color3"] = true,
+	["BrickColor"] = true,
+	["UDim"] = true,
+	["UDim2"] = true,
+	["Rect"] = true,
+	["Region3"] = true,
+	["Ray"] = true,
+	["NumberRange"] = true,
+	["NumberSequence"] = true,
+	["ColorSequence"] = true,
+	["Axes"] = true,
+	["Faces"] = true,
+	["PhysicalProperties"] = true,
+	["TweenInfo"] = true,
+	["DateTime"] = true,
+}
+
 function Validation.ShouldDefaultStrict() : boolean
 	return RunService:IsStudio()
 end
@@ -47,6 +83,10 @@ function Validation.IsJsonSafe(
 		return true, nil
 	end
 
+	if NON_SERIALIZABLE_TYPES[ValueType] then
+		return false, `{CurrentPath}: Type '{ValueType}' is not JSON-serializable (DataStore cannot round-trip this value)`
+	end
+
 	if ValueType == "table" then
 		local TableValue = Value :: { [unknown] : unknown }
 
@@ -55,9 +95,15 @@ function Validation.IsJsonSafe(
 		end
 		SeenTables[TableValue] = true
 
+		-- Reject mixed arrays/dicts because JSONEncode will silently convert
+		-- them into something the caller didn't intend.
+		local HasStringKeys = false
+		local HasArrayKeys = false
+
 		for TableKey, TableEntry in TableValue do
 			local KeyType = typeof(TableKey)
 			if KeyType == "string" then
+				HasStringKeys = true
 				local ChildOk, ChildError = Validation.IsJsonSafe(
 					TableEntry, `{CurrentPath}.{TableKey}`, SeenTables
 				)
@@ -69,6 +115,7 @@ function Validation.IsJsonSafe(
 				if NumericKey ~= math.floor(NumericKey) or NumericKey < 1 then
 					return false, `{CurrentPath}: Non-positive-integer numeric key [{TableKey}]`
 				end
+				HasArrayKeys = true
 				local ChildOk, ChildError = Validation.IsJsonSafe(
 					TableEntry, `{CurrentPath}[{TableKey}]`, SeenTables
 				)
@@ -78,6 +125,10 @@ function Validation.IsJsonSafe(
 			else
 				return false, `{CurrentPath}: Key of type '{KeyType}' is not JSON-serializable`
 			end
+		end
+
+		if HasStringKeys and HasArrayKeys then
+			return false, `{CurrentPath}: Mixed string/numeric keys are not JSON-safe (will corrupt on round-trip)`
 		end
 
 		SeenTables[TableValue] = nil
@@ -141,6 +192,7 @@ function Validation.ValidateTransformPurity<DataType>(
 ) : Result<boolean>
 	local ClonedInputA = Validation.DeepClone(InputData)
 	local ClonedInputB = Validation.DeepClone(InputData)
+	local InputSnapshot = Validation.DeepClone(InputData)
 
 	local SuccessA, ResultA = pcall(Transform, ClonedInputA)
 	local SuccessB, ResultB = pcall(Transform, ClonedInputB)
@@ -153,6 +205,14 @@ function Validation.ValidateTransformPurity<DataType>(
 	end
 
 	if ResultA == nil and ResultB == nil then
+		-- If the transform returns nil (abort), it must not have mutated the
+		-- input — otherwise the caller gets silent partial mutations.
+		if not Validation.DeepEqual(ClonedInputA, InputSnapshot) then
+			return Errors.Fail(Errors.New(
+				"StrictModeViolation",
+				"Transform returned nil but mutated its input in-place"
+			))
+		end
 		return Errors.Passed(true)
 	end
 

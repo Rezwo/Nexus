@@ -14,6 +14,7 @@ local InboxModule = require(script.Inbox)
 local Budget = require(script.Budget)
 local MemoryBudget = require(script.MemoryBudget)
 local Transaction = require(script.Transaction)
+local MockDataStoreModule = require(script.MockDataStore)
 
 export type Result<Value> = Types.Result<Value>
 export type SuccessResult<Value> = Types.SuccessResult<Value>
@@ -53,6 +54,9 @@ export type AuditEntry = Types.AuditEntry
 export type MiddlewarePhase = Types.MiddlewarePhase
 export type DebugContext = Types.DebugContext
 export type SoftDeleteInfo = Types.SoftDeleteInfo
+export type MockStore = MockDataStoreModule.MockStore
+export type MockStoreOptions = MockDataStoreModule.MockStoreOptions
+export type TransactionRollbackStatus = Types.TransactionRollbackStatus
 
 local Nexus = {}
 
@@ -75,6 +79,7 @@ Nexus.Lifecycle = Lifecycle
 Nexus.Telemetry = Telemetry
 Nexus.Budget = Budget
 Nexus.MemoryBudget = MemoryBudget
+Nexus.MockDataStore = MockDataStoreModule
 
 Nexus.CreateSemaphore = Semaphore.New
 
@@ -107,6 +112,26 @@ function Nexus.Transact(
 	Participants : { { Store : Store.StoreObject<any>, Key : string, Transform : (Data : any) -> any? } },
 	Configuration : TransactionConfiguration?
 ) : TransactionResult
+	-- Pre-validate: every participant must have an active session so rollback
+	-- snapshots can be captured. Fail early rather than discovering a missing
+	-- session mid-execution with some keys already committed.
+	for _, Entry in Participants do
+		local TargetSession = (Entry.Store :: any)._Sessions[Entry.Key]
+		if not TargetSession then
+			local MissingError = Errors.New("SessionNotFound",
+				`No active session for key '{Entry.Key}' in cross-store transaction`,
+				{ Key = Entry.Key }
+			)
+			return {
+				Passed = false,
+				Error = MissingError,
+				Results = {},
+				Rollbacks = nil,
+				PartiallyCommitted = false,
+			}
+		end
+	end
+
 	local TransactionInstance = Transaction.New(Configuration)
 
 	for _, Entry in Participants do

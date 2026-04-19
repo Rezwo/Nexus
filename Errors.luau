@@ -9,6 +9,17 @@ type ErrorResult = Types.ErrorResult
 
 local Errors = {}
 
+local CorrelationCounter = 0
+local ProcessTag = string.format("%04x", math.random(0, 0xffff))
+
+-- Cheap 16-hex-char ID: enough uniqueness to correlate logs across Telemetry,
+-- middleware, and callbacks without requiring HttpService (so it's usable in
+-- tests that stub out game services).
+function Errors.NewCorrelationId() : string
+	CorrelationCounter += 1
+	return string.format("%s%012x", ProcessTag, CorrelationCounter)
+end
+
 function Errors.New(
 	Kind : ErrorKind,
 	Message : string,
@@ -17,6 +28,7 @@ function Errors.New(
 		Key : string?,
 		Retries : number?,
 		Cause : string?,
+		CorrelationId : string?,
 	}?
 ) : NexusError
 	return {
@@ -26,6 +38,7 @@ function Errors.New(
 		Key = if Extra then Extra.Key else nil,
 		Retries = if Extra then Extra.Retries else nil,
 		Cause = if Extra then Extra.Cause else nil,
+		CorrelationId = if Extra and Extra.CorrelationId then Extra.CorrelationId else Errors.NewCorrelationId(),
 	}
 end
 
@@ -67,6 +80,9 @@ end
 
 function Errors.Format(Error : NexusError) : string
 	local Parts = { `[Nexus:{Error.Kind}] {Error.Message}` }
+	if Error.CorrelationId then
+		table.insert(Parts, `CorrelationId = {Error.CorrelationId}`)
+	end
 	if Error.Key then
 		table.insert(Parts,`Key = {Error.Key}`)
 	end

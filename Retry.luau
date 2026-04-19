@@ -35,11 +35,14 @@ function Retry.Execute<Value>(
 	local LastError : NexusError? = nil
 
 	for Attempt = 0, MaximumRetries do
-		if Attempt > 0 and RequestBudgetType then
+		-- Gate on request budget for every attempt, not just retries. Without
+		-- this, the first attempt could immediately throttle against an empty
+		-- budget and consume a retry allotment for no reason.
+		if RequestBudgetType then
 			local BudgetResult = Budget.WaitForCapacity(RequestBudgetType)
 			if not BudgetResult.Passed then
 				return Errors.Fail(Errors.New("BudgetExhausted",
-					`Budget exhausted after {Attempt} retries`,
+					`Budget exhausted after {Attempt} attempts`,
 					{ Retries = Attempt, Key = if LastError then LastError.Key else nil }
 				))
 			end

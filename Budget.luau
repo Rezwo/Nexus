@@ -141,8 +141,18 @@ function Budget._EnsureDrainer() : ()
 			end
 
 			if not AnyPending then
-				DrainerRunning = false
-				break
+				-- Defense-in-depth re-check: even though cooperative Luau
+				-- prevents an enqueue from slipping in between these lines,
+				-- future language/scheduler changes could break that, so we
+				-- re-scan before declaring the drainer idle.
+				local ResidualPending = false
+				for _, Queue in OperationQueues do
+					if #Queue > 0 then ResidualPending = true; break end
+				end
+				if not ResidualPending then
+					DrainerRunning = false
+					break
+				end
 			end
 		end
 	end)
