@@ -67,12 +67,13 @@ do
 	local LoadResult = Store:Load("ShutDownKey")
 	if LoadResult.Passed then
 		-- Simulate shutting down
-		;(Store :: any)._ShuttingDown = true
+		local AnyStore = Store :: any
+		AnyStore._ShuttingDown = true
 		local SaveR = Store:Save("ShutDownKey")
 		Assert(SaveR.Passed == false, "[expected] Save fails during mock shutdown")
 		
 		-- Un-shutdown for teardown
-		;(Store :: any)._ShuttingDown = false
+		AnyStore._ShuttingDown = false
 	end
 	
 	Harness:Teardown()
