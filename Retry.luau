@@ -14,10 +14,10 @@ local DEFAULT_MAXIMUM_RETRIES = 5
 local BASE_DELAY = 1.0
 local MAXIMUM_DELAY = 30.0
 
-local function ComputeDelay(Attempt : number, PreviousDelay : number) : number
-	local UpperBound = math.min(MAXIMUM_DELAY, PreviousDelay * 3)
-	local Delay = BASE_DELAY + math.random() * (UpperBound - BASE_DELAY)
-	return math.min(Delay, MAXIMUM_DELAY)
+local function ComputeDelay(Attempt : number) : number
+	local Exponential = BASE_DELAY * (2 ^ Attempt)
+	local Jitter = math.random() * BASE_DELAY
+	return math.min(Exponential + Jitter, MAXIMUM_DELAY)
 end
 
 export type RetryConfiguration = Types.RetryConfiguration
@@ -31,15 +31,17 @@ function Retry.Execute<Value>(
 	local RequestBudgetType = Config.BudgetType
 	local OnRetryCallback = Config.OnRetry
 
-	local PreviousDelay = BASE_DELAY
 	local LastError : NexusError? = nil
 
 	for Attempt = 0, MaximumRetries do
-		if Attempt > 0 and RequestBudgetType then
+		-- Gate on request budget for every attempt, not just retries. Without
+		-- this, the first attempt could immediately throttle against an empty
+		-- budget and consume a retry allotment for no reason.
+		if RequestBudgetType then
 			local BudgetResult = Budget.WaitForCapacity(RequestBudgetType)
 			if not BudgetResult.Passed then
 				return Errors.Fail(Errors.New("BudgetExhausted",
-					`Budget exhausted after {Attempt} retries`,
+					`Budget exhausted after {Attempt} attempts`,
 					{ Retries = Attempt, Key = if LastError then LastError.Key else nil }
 				))
 			end
@@ -64,8 +66,7 @@ function Retry.Execute<Value>(
 		end
 
 		if Attempt < MaximumRetries then
-			local Delay = ComputeDelay(Attempt, PreviousDelay)
-			PreviousDelay = Delay
+			local Delay = ComputeDelay(Attempt)
 
 			if OnRetryCallback then
 				OnRetryCallback(Attempt + 1, Delay, LastError)

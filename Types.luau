@@ -21,6 +21,7 @@ export type NexusError = {
 	Key : string?,
 	Retries : number?,
 	Cause : string?,
+	CorrelationId : string?,
 }
 
 export type ErrorKind =
@@ -122,6 +123,9 @@ export type StoreConfiguration<DataType> = {
 	Debug : boolean?,
 	IdleTimeout : number?,
 	IdleCheckInterval : number?,
+	WriteCooldown : number?,
+	ReadOnly : boolean?,
+	CloseSaveMaxRetries : number?,
 }
 
 export type LockMode =
@@ -140,10 +144,18 @@ export type TransactionConfiguration = {
 	MaxRetries : number?,
 }
 
+export type TransactionRollbackStatus = {
+	Key : string,
+	Succeeded : boolean,
+	Error : NexusError?,
+}
+
 export type TransactionResult = {
 	Passed : boolean,
 	Error : NexusError?,
 	Results : { [string] : Result<boolean> },
+	Rollbacks : { TransactionRollbackStatus }?,
+	PartiallyCommitted : boolean?,
 }
 
 export type VersionInfo = {

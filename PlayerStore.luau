@@ -325,7 +325,17 @@ function PlayerStore.DrainInbox<DataType>(
 		end)
 
 		if not UpdateResult.Passed then
-			warn(`[Nexus] PlayerStore: gift processing failed for '{Key}', gifts may be lost`)
+			-- The inbox was cleared but the in-memory update failed. Re-queue
+			-- the items so they are not silently lost. This can result in
+			-- duplicate delivery if a previous partial merge succeeded, but
+			-- that is preferable to invisible data loss.
+			warn(`[Nexus] PlayerStore: gift processing failed for '{Key}', re-queuing {#Items} item(s)`)
+			task.spawn(function()
+				for _, Item in Items do
+					self._Inbox:Push(Key, Item.Sender, Item.Payload)
+				end
+			end)
+			return Errors.Fail((UpdateResult :: Types.ErrorResult).Error)
 		end
 	end
 
@@ -409,12 +419,16 @@ function PlayerStore._LoadPlayer<DataType>(
 	end
 
 	self._LoadingPlayers[UserId] = nil
-	Telemetry.Record("PlayerStore.Load", os.clock() - StartTime, LoadResult.Passed)
-
+	Telemetry.Record("PlayerStore.Load", os.clock() - StartTime, LoadResult.Passed,
+		if not LoadResult.Passed then (LoadResult :: Types.ErrorResult).Error else nil)
 
 	if not TargetPlayer:IsDescendantOf(Players) then
 		if LoadResult.Passed then
-			self._Store:Close(Key)
+			-- Player left while we were loading; release the session so the
+			-- lock and data are not held indefinitely.
+			task.spawn(function()
+				self._Store:Close(Key)
+			end)
 		end
 		return
 	end
@@ -447,9 +461,15 @@ function PlayerStore._LoadPlayer<DataType>(
 					if #Items > 0 then
 						local ProcessGift = self._Configuration.ProcessGift
 						if ProcessGift and self._Store:IsLoaded(Key) then
-							self._Store:Update(Key, function(CurrentData : DataType) : DataType?
+							local UpdateResult = self._Store:Update(Key, function(CurrentData : DataType) : DataType?
 								return MergeGifts(CurrentData, Items, ProcessGift)
 							end)
+							if not UpdateResult.Passed then
+								warn(`[Nexus] PlayerStore: initial gift drain failed for '{Key}', re-queuing {#Items} item(s)`)
+								for _, Item in Items do
+									self._Inbox:Push(Key, Item.Sender, Item.Payload)
+								end
+							end
 						end
 
 						self.OnGiftReceived:Fire(TargetPlayer, Items)
@@ -487,8 +507,13 @@ function PlayerStore._UnloadPlayer<DataType>(
 
 	if self._Store:IsLoaded(Key) then
 		local StartTime = os.clock()
-		self._Store:Close(Key)
-		Telemetry.Record("PlayerStore.Close", os.clock() - StartTime, true)
+		local CloseResult = self._Store:Close(Key)
+		local CloseOk = CloseResult.Passed
+		Telemetry.Record("PlayerStore.Close", os.clock() - StartTime, CloseOk,
+			if not CloseOk then (CloseResult :: Types.ErrorResult).Error else nil)
+		if not CloseOk then
+			warn(`[Nexus] PlayerStore: close failed for '{Key}': {(CloseResult :: Types.ErrorResult).Error.Message}`)
+		end
 	end
 end
 

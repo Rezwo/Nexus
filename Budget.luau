@@ -122,6 +122,7 @@ function Budget._EnsureDrainer() : ()
 
 				while #Queue > 0 and Budget.HasCapacity(RequestBudgetType) do
 					local Entry = table.remove(Queue, 1) :: QueuedOperation
+					if coroutine.status(Entry.Thread) ~= "suspended" then continue end
 					if CurrentTime - Entry.EnqueuedAt > MAXIMUM_QUEUE_WAIT then
 						task.spawn(Entry.Thread, false)
 					else
@@ -133,7 +134,9 @@ function Budget._EnsureDrainer() : ()
 				while Index <= #Queue do
 					if CurrentTime - Queue[Index].EnqueuedAt > MAXIMUM_QUEUE_WAIT then
 						local TimedOutEntry = table.remove(Queue, Index) :: QueuedOperation
-						task.spawn(TimedOutEntry.Thread, false)
+						if coroutine.status(TimedOutEntry.Thread) == "suspended" then
+							task.spawn(TimedOutEntry.Thread, false)
+						end
 					else
 						Index += 1
 					end
@@ -141,8 +144,18 @@ function Budget._EnsureDrainer() : ()
 			end
 
 			if not AnyPending then
-				DrainerRunning = false
-				break
+				-- Defense-in-depth re-check: even though cooperative Luau
+				-- prevents an enqueue from slipping in between these lines,
+				-- future language/scheduler changes could break that, so we
+				-- re-scan before declaring the drainer idle.
+				local ResidualPending = false
+				for _, Queue in OperationQueues do
+					if #Queue > 0 then ResidualPending = true; break end
+				end
+				if not ResidualPending then
+					DrainerRunning = false
+					break
+				end
 			end
 		end
 	end)

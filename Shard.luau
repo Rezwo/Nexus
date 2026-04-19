@@ -64,9 +64,25 @@ function Shard.WriteShards(
 		end, { MaxRetries = RetryCount, BudgetType = "SetIncrementAsync" } :: any)
 
 		if not WriteResult.Passed then
+			-- Best-effort cleanup of shards written before this failure so we
+			-- don't leave orphaned chunks consuming quota. This is fire-and-
+			-- forget — if cleanup itself fails there is nothing productive to
+			-- do beyond surfacing the original write error.
+			if Index > 1 then
+				task.spawn(function()
+					for CleanupIndex = 1, Index - 1 do
+						local CleanupKey = Shard.ShardKey(BaseKey, CleanupIndex)
+						pcall(function()
+							DataStore:RemoveAsync(CleanupKey)
+						end)
+					end
+				end)
+			end
+
 			return Errors.Fail(Errors.New("DataStoreError",
 				`Failed to write shard {Index}/{#Chunks} for key '{BaseKey}': `
-				.. `{(WriteResult :: Types.ErrorResult).Error.Message}`
+				.. `{(WriteResult :: Types.ErrorResult).Error.Message}`,
+				{ Key = BaseKey }
 			))
 		end
 	end

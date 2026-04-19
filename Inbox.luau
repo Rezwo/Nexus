@@ -273,15 +273,30 @@ function Inbox._NotifyRecipient(self : InboxManager, RecipientKey : string) : ()
 			Key = RecipientKey,
 		})
 
-		local PublishSuccess, PublishError = pcall(function()
-			MessagingService:PublishAsync(self._TopicName, PayloadString)
-			return nil :: any
-		end)
+		-- Throttled/transient notification failures are common; retry a few
+		-- times with exponential backoff. The data write already succeeded,
+		-- so a dropped notification only costs reactive drain latency.
+		local MaxAttempts = 3
+		local Delay = 1
+		local LastError : any = nil
+		for Attempt = 1, MaxAttempts do
+			local PublishSuccess, PublishError = pcall(function()
+				MessagingService:PublishAsync(self._TopicName, PayloadString)
+				return nil :: any
+			end)
 
-		if not PublishSuccess then
+			if PublishSuccess then
+				return
+			end
 
-			warn(`[Nexus] Inbox: notification failed for '{RecipientKey}': {PublishError}`)
+			LastError = PublishError
+			if Attempt < MaxAttempts then
+				task.wait(Delay)
+				Delay = math.min(Delay * 2, 8)
+			end
 		end
+
+		warn(`[Nexus] Inbox: notification failed for '{RecipientKey}' after {MaxAttempts} attempts: {LastError}`)
 	end)
 end
 

@@ -10,6 +10,7 @@ local MAXIMUM_QUEUE_WAIT = 30
 local FAILURE_WINDOW = 10
 local FAILURE_THRESHOLD = 5
 local BACKOFF_DURATION = 5
+local CONSECUTIVE_SUCCESSES_TO_RESET = 3
 
 type QueuedOperation = {
 	Thread : thread,
@@ -18,6 +19,7 @@ type QueuedOperation = {
 
 type ResourceBucket = {
 	Failures : { number },
+	ConsecutiveSuccesses : number,
 	BackoffUntil : number,
 	Queues : { [string] : { QueuedOperation } },
 	Draining : boolean,
@@ -30,6 +32,7 @@ local function GetBucket(Resource : string) : ResourceBucket
 	if ExistingBucket then return ExistingBucket end
 	local NewBucket : ResourceBucket = {
 		Failures = {},
+		ConsecutiveSuccesses = 0,
 		BackoffUntil = 0,
 		Queues = {},
 		Draining = false,
@@ -71,11 +74,19 @@ local MemoryBudget = {}
 function MemoryBudget.RecordFailure(Resource : string) : ()
 	local Bucket = GetBucket(Resource)
 	table.insert(Bucket.Failures, os.clock())
+	Bucket.ConsecutiveSuccesses = 0
 end
 
 function MemoryBudget.RecordSuccess(Resource : string) : ()
 	local Bucket = GetBucket(Resource)
-	if #Bucket.Failures > 0 then
+	Bucket.ConsecutiveSuccesses += 1
+	if Bucket.ConsecutiveSuccesses >= CONSECUTIVE_SUCCESSES_TO_RESET then
+		-- Sustained recovery — clear accumulated state so this resource
+		-- doesn't flap back into backoff off old failures.
+		table.clear(Bucket.Failures)
+		Bucket.BackoffUntil = 0
+		Bucket.ConsecutiveSuccesses = 0
+	elseif #Bucket.Failures > 0 then
 		table.remove(Bucket.Failures, 1)
 	end
 end
@@ -113,13 +124,21 @@ function MemoryBudget.GetStatus(Resource : string) : {
 	InBackoff : boolean,
 	BackoffRemaining : number,
 	RecentFailureCount : number,
+	ConsecutiveSuccesses : number,
+	QueueDepth : number,
 	}
 	local Bucket = GetBucket(Resource)
 	local CurrentTime = os.clock()
+	local QueueDepth = 0
+	for _, Queue in Bucket.Queues do
+		QueueDepth += #Queue
+	end
 	return {
 		InBackoff = IsInBackoff(Bucket),
 		BackoffRemaining = math.max(0, Bucket.BackoffUntil - CurrentTime),
 		RecentFailureCount = #Bucket.Failures,
+		ConsecutiveSuccesses = Bucket.ConsecutiveSuccesses,
+		QueueDepth = QueueDepth,
 	}
 end
 
@@ -129,9 +148,20 @@ function MemoryBudget.Reset(Resource : string?) : ()
 		if Bucket then
 			table.clear(Bucket.Failures)
 			Bucket.BackoffUntil = 0
+			Bucket.ConsecutiveSuccesses = 0
 		end
 	else
-
+		-- Wake any stranded waiters across all buckets before wiping state.
+		for _, ExistingBucket in Buckets do
+			for _QueueKey, Queue in ExistingBucket.Queues do
+				while #Queue > 0 do
+					local QueueEntry = table.remove(Queue, 1) :: QueuedOperation
+					if coroutine.status(QueueEntry.Thread) == "suspended" then
+						task.spawn(QueueEntry.Thread, false)
+					end
+				end
+			end
+		end
 		table.clear(Buckets)
 	end
 end
@@ -155,6 +185,7 @@ function MemoryBudget._EnsureDrainer(Resource : string) : ()
 
 				while #Queue > 0 and not IsInBackoff(Bucket) do
 					local QueueEntry = table.remove(Queue, 1) :: QueuedOperation
+					if coroutine.status(QueueEntry.Thread) ~= "suspended" then continue end
 					if CurrentTime - QueueEntry.EnqueuedAt > MAXIMUM_QUEUE_WAIT then
 						task.spawn(QueueEntry.Thread, false)
 					else
@@ -166,16 +197,27 @@ function MemoryBudget._EnsureDrainer(Resource : string) : ()
 				while Index <= #Queue do
 					if CurrentTime - Queue[Index].EnqueuedAt > MAXIMUM_QUEUE_WAIT then
 						local TimedOutEntry = table.remove(Queue, Index) :: QueuedOperation
-						task.spawn(TimedOutEntry.Thread, false)
+						if coroutine.status(TimedOutEntry.Thread) == "suspended" then
+							task.spawn(TimedOutEntry.Thread, false)
+						end
 					else
 						Index += 1
 					end
 				end
 			end
 
+			-- Re-check pending under cooperative semantics: no yield happens
+			-- between this check and clearing Draining, so no race with new
+			-- enqueues (_EnsureDrainer only spawns if Draining is false).
 			if not AnyPending then
-				Bucket.Draining = false
-				break
+				local ResidualPending = false
+				for _QueueKey, Queue in Bucket.Queues do
+					if #Queue > 0 then ResidualPending = true; break end
+				end
+				if not ResidualPending then
+					Bucket.Draining = false
+					break
+				end
 			end
 		end
 	end)

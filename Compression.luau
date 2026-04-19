@@ -11,6 +11,17 @@ type Result<Value> = Types.Result<Value>
 local Compression = {}
 
 local DEFAULT_COMPRESSION_LEVEL = 3
+local MIN_COMPRESSION_LEVEL = 1
+local MAX_COMPRESSION_LEVEL = 22
+
+local function ResolveLevel(Requested : number?) : number
+	if Requested == nil then return DEFAULT_COMPRESSION_LEVEL end
+	if typeof(Requested) ~= "number" or Requested ~= Requested then
+		return DEFAULT_COMPRESSION_LEVEL
+	end
+	local Clamped = math.clamp(math.floor(Requested), MIN_COMPRESSION_LEVEL, MAX_COMPRESSION_LEVEL)
+	return Clamped
+end
 
 function Compression.Compress(
 	Data : { [string] : unknown },
@@ -21,7 +32,7 @@ function Compression.Compress(
 		return Errors.Fail(Errors.New("CompressionError", `Failed to JSON-encode: {JsonString}`))
 	end
 
-	local Level = CompressionLevel or DEFAULT_COMPRESSION_LEVEL
+	local Level = ResolveLevel(CompressionLevel)
 	local InputBuffer = buffer.fromstring(JsonString :: string)
 
 	local CompressSuccess, CompressedBuffer = pcall(function()
@@ -45,7 +56,7 @@ function Compression.CompressString(
 	JsonString : string,
 	CompressionLevel : number?
 ) : Result<string>
-	local Level = CompressionLevel or DEFAULT_COMPRESSION_LEVEL
+	local Level = ResolveLevel(CompressionLevel)
 	local InputBuffer = buffer.fromstring(JsonString)
 
 	local CompressSuccess, CompressedBuffer = pcall(function()
@@ -93,6 +104,35 @@ function Compression.EstimateSize(Data : { [string] : unknown }) : number
 		return 0
 	end
 	return #(JsonString :: string)
+end
+
+-- Single-encode helper: JSON-encodes once and compresses only if the result
+-- exceeds Threshold. Returns (payload, isCompressed, jsonSize). This avoids
+-- the double JSONEncode that happens when callers call EstimateSize then Compress.
+function Compression.TryCompress(
+	Data : { [string] : unknown },
+	Threshold : number,
+	CompressionLevel : number?
+) : ({ [string] : unknown } | string, boolean, number)
+	local EncodeOk, JsonString = pcall(HttpService.JSONEncode, HttpService, Data)
+	if not EncodeOk then return Data, false, 0 end
+	local Size = #(JsonString :: string)
+	if Size <= Threshold then return Data, false, Size end
+
+	local Level = ResolveLevel(CompressionLevel)
+	local InputBuffer = buffer.fromstring(JsonString :: string)
+
+	local CompressOk, CompressedBuffer = pcall(function()
+		return EncodingService:CompressBuffer(InputBuffer, Enum.CompressionAlgorithm.Zstd, Level)
+	end)
+	if not CompressOk then return Data, false, Size end
+
+	local Base64Ok, Base64Buffer = pcall(function()
+		return EncodingService:Base64Encode(CompressedBuffer :: buffer)
+	end)
+	if not Base64Ok then return Data, false, Size end
+
+	return buffer.tostring(Base64Buffer :: buffer), true, Size
 end
 
 function Compression._DecompressZstd(EncodedData : string) : Result<{ [string] : unknown }>
