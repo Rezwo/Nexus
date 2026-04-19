@@ -41,7 +41,7 @@ TestHarness.__index = TestHarness
 function TestHarness.New()
 	local self = setmetatable({}, TestHarness)
 	self.Stores = {}
-	self.InitialStoreCount = #Nexus.Lifecycle.GetAll()
+	self.InitialStoreCount = Nexus.Lifecycle.GetRegisteredCount()
 	MockDataStore.Inject()
 	return self
 end
@@ -71,7 +71,7 @@ function TestHarness:Teardown()
 	table.clear(self.Stores)
 	MockDataStore.Unject()
 	
-	local FinalStoreCount = #Nexus.Lifecycle.GetAll()
+	local FinalStoreCount = Nexus.Lifecycle.GetRegisteredCount()
 	Helpers.Assert(FinalStoreCount == self.InitialStoreCount, "Lifecycle count returned to baseline", `Expected {self.InitialStoreCount}, got {FinalStoreCount}`)
 end
 
