@@ -922,12 +922,14 @@ do
 	if RemoteAudit.Passed then
 		local Entries = (RemoteAudit :: any).Value
 		Assert(#Entries > 0, "E23: Remote audit has entries", tostring(#Entries))
+		local Valid = true
 		for _, Entry in Entries do
-			Assert(Entry.Timestamp ~= nil,  "E23: Entry has Timestamp")
-			Assert(Entry.Operation ~= nil,  "E23: Entry has Operation")
-			Assert(Entry.Source ~= nil,     "E23: Entry has Source")
-			Assert(Entry.SessionId ~= nil,  "E23: Entry has SessionId")
+			if not (Entry.Timestamp and Entry.Operation and Entry.Source and Entry.SessionId) then
+				Valid = false
+				break
+			end
 		end
+		Assert(Valid, "E23: Remote audit entries are structurally valid")
 	end
 
 	Store2:Destroy()

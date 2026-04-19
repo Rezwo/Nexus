@@ -67,7 +67,9 @@ do
 	local Harness = NexusTestHelpers.TestHarness.New()
 	local Store = Harness:CreateStore({ Name = "Failures_Circuit", Schema = TestSchema })
 	for i=1, 6 do
-		MockDataStore.Fault("Failures_Circuit", "GetAsync", "Trigger Circuit")
+		for _ = 1, (Store._Configuration.MaxRetries or 5) + 1 do
+			MockDataStore.Fault("Failures_Circuit", "GetAsync", "Trigger Circuit")
+		end
 		local r = Store:Load("CircKey" .. i)
 		Assert(r.Passed == false, "[expected] Circuit load " .. i .. " fails")
 	end
@@ -82,8 +84,8 @@ do
 	
 	local ShardDS = MockDataStore.GetOrCreate("Failures_Shard", "global")
 	ShardDS:Seed("ShardKey", {
-		__shards = 5,
-		__v = 1
+		_s = 5,
+		_v = 1
 	})
 	ShardDS:Seed("ShardKey_shard_1", "part1")
 	
