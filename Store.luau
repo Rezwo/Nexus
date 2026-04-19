@@ -1886,97 +1886,75 @@ function Store._FlushAuditLog<DataType>(self : StoreObject<DataType>, Key : stri
 	local ShardThreshold = self._Configuration.AuditShardThreshold or DEFAULT_AUDIT_SHARD_THRESHOLD
 	local MaxRetries = self._Configuration.MaxRetries or 5
 
-
-	local ExistingEntries : { AuditEntry } = {}
 	local OldAuditShardCount = self._AuditShardCounts[Key] or 0
 
+	-- Read the manifest once to detect whether the remote value is already sharded.
 	local ReadSuccess, ReadResult = pcall(function()
 		return self._DataStore:GetAsync(AuditKey)
 	end)
 
+	local RemoteIsSharded = false
 	if ReadSuccess and ReadResult ~= nil and typeof(ReadResult) == "table" then
 		local RemoteTable = ReadResult :: any
 		local RemoteShardCount = RemoteTable._s
 		if typeof(RemoteShardCount) == "number" and RemoteShardCount > 0 then
-
+			RemoteIsSharded = true
 			OldAuditShardCount = RemoteShardCount
-			local ShardReadResult = Shard.ReadShards(self._DataStore, AuditKey, RemoteShardCount, MaxRetries)
-			if ShardReadResult.Passed then
-				local CompressedPayload = (ShardReadResult :: Types.SuccessResult<string>).Value
-				local DecompressResult = Compression.DecompressToString(CompressedPayload)
-				if DecompressResult.Passed then
-					local JsonString = (DecompressResult :: Types.SuccessResult<string>).Value
-					local ParseSuccess, ParsedEntries = pcall(HttpService.JSONDecode, HttpService, JsonString)
-					if ParseSuccess and typeof(ParsedEntries) == "table" then
-						ExistingEntries = ParsedEntries :: any
-					end
-				end
-			end
-		elseif RemoteTable._c == true and typeof(RemoteTable._d) == "string" then
-
-			local DecompressResult = Compression.DecompressToString(RemoteTable._d :: string)
-			if DecompressResult.Passed then
-				local JsonString = (DecompressResult :: Types.SuccessResult<string>).Value
-				local ParseSuccess, ParsedEntries = pcall(HttpService.JSONDecode, HttpService, JsonString)
-				if ParseSuccess and typeof(ParsedEntries) == "table" then
-					ExistingEntries = ParsedEntries :: any
-				end
-			end
 		end
 	end
 
+	if RemoteIsSharded then
+		-- Sharded path: read all chunks, merge, write back.
+		-- Multi-key writes cannot be made atomic with Roblox DataStore; a
+		-- concurrent flush from another server in this rare path (audit logs
+		-- > AuditShardThreshold) may still drop entries.
+		local ExistingEntries : { AuditEntry } = {}
+		local ShardReadResult = Shard.ReadShards(self._DataStore, AuditKey, OldAuditShardCount, MaxRetries)
+		if ShardReadResult.Passed then
+			local DecompressResult = Compression.DecompressToString(
+				(ShardReadResult :: Types.SuccessResult<string>).Value)
+			if DecompressResult.Passed then
+				local ParseOk, Parsed = pcall(HttpService.JSONDecode, HttpService,
+					(DecompressResult :: Types.SuccessResult<string>).Value)
+				if ParseOk and typeof(Parsed) == "table" then
+					ExistingEntries = Parsed :: any
+				end
+			end
+		end
 
-	local MergedEntries : { AuditEntry } = {}
+		local Merged : { AuditEntry } = {}
+		for _, Entry in ExistingEntries do table.insert(Merged, Entry) end
+		for _, Entry in LocalEntries do table.insert(Merged, Entry) end
+		while #Merged > MaxSize do table.remove(Merged, 1) end
 
+		local EncodeOk, Json = pcall(HttpService.JSONEncode, HttpService, Merged)
+		if not EncodeOk then
+			warn(`[Nexus] _FlushAuditLog: JSON encode failed for '{AuditKey}': {Json}`)
+			return
+		end
 
-	for _, Entry in ExistingEntries do
-		table.insert(MergedEntries, Entry)
-	end
+		local CompressRes = Compression.CompressString(Json :: string)
+		if not CompressRes.Passed then
+			warn(`[Nexus] _FlushAuditLog: compress failed for '{AuditKey}'`)
+			return
+		end
 
-
-	for _, Entry in LocalEntries do
-		table.insert(MergedEntries, Entry)
-	end
-
-
-	while #MergedEntries > MaxSize do
-		table.remove(MergedEntries, 1)
-	end
-
-
-	local EncodeSuccess, JsonPayload = pcall(HttpService.JSONEncode, HttpService, MergedEntries)
-	if not EncodeSuccess then
-		warn(`[Nexus] _FlushAuditLog: JSON encode failed for '{AuditKey}': {JsonPayload}`)
-		return
-	end
-
-	local CompressResult = Compression.CompressString(JsonPayload :: string)
-	if not CompressResult.Passed then
-		warn(`[Nexus] _FlushAuditLog: compress failed for '{AuditKey}'`)
-		return
-	end
-
-	local CompressedPayload = (CompressResult :: Types.SuccessResult<string>).Value
-
-
-	local NeedsSharding = #CompressedPayload > ShardThreshold and ShardThreshold > 0
-
-	if NeedsSharding then
-		local Chunks = Shard.Split(CompressedPayload, ShardThreshold)
+		local Payload = (CompressRes :: Types.SuccessResult<string>).Value
+		local Chunks = Shard.Split(Payload, ShardThreshold)
 		local NewShardCount = #Chunks
 
 		local ShardWriteResult = Shard.WriteShards(self._DataStore, AuditKey, Chunks, MaxRetries)
 		if not ShardWriteResult.Passed then
 			warn(`[Nexus] _FlushAuditLog: shard write failed for '{AuditKey}' — dirty flag preserved for retry`)
-			return  -- leave _AuditDirty[Key] = true so the next flush retries
+			return
 		end
 
-		local ManifestSuccess, ManifestError = pcall(function()
+		local ManifestOk, ManifestErr = pcall(function()
 			self._DataStore:SetAsync(AuditKey, { _s = NewShardCount })
 		end)
-		if not ManifestSuccess then
-			warn(`[Nexus] _FlushAuditLog: manifest SetAsync failed for '{AuditKey}': {ManifestError}`)
-			return  -- shards written but manifest failed; dirty flag stays for retry
+		if not ManifestOk then
+			warn(`[Nexus] _FlushAuditLog: manifest SetAsync failed for '{AuditKey}': {ManifestErr}`)
+			return
 		end
 
 		if OldAuditShardCount > NewShardCount then
@@ -1984,29 +1962,116 @@ function Store._FlushAuditLog<DataType>(self : StoreObject<DataType>, Key : stri
 		end
 
 		self._AuditShardCounts[Key] = NewShardCount
+		self._AuditDirty[Key] = false
 		self:_DebugLog("AuditFlush.Sharded", Key)
-	else
-		local DirectSuccess, DirectError = pcall(function()
-			self._DataStore:SetAsync(AuditKey, {
-				_c = true,
-				_d = CompressedPayload,
-			})
-		end)
-		if not DirectSuccess then
-			warn(`[Nexus] _FlushAuditLog: SetAsync failed for '{AuditKey}': {DirectError} — dirty flag preserved for retry`)
-			return  -- leave _AuditDirty[Key] = true so the next flush retries
-		end
-
-		if OldAuditShardCount > 0 then
-			Shard.DeleteAllShards(self._DataStore, AuditKey, OldAuditShardCount)
-		end
-
-		self._AuditShardCounts[Key] = 0
-		self:_DebugLog("AuditFlush.Direct", Key)
+		return
 	end
 
-	-- Only clear dirty after a confirmed successful write.
+	-- Non-sharded path: UpdateAsync makes the read-modify-write atomic.
+	-- The callback receives the current remote value (not the snapshot from the
+	-- GetAsync above), so any entries written by another server in the interim
+	-- are included — eliminating the race that SetAsync would cause.
+	local CallbackSucceeded = false
+	local CallbackNeedsSharding = false
+	local ShardingPayload : string? = nil
+
+	local UpdateOk, UpdateErr = pcall(function()
+		self._DataStore:UpdateAsync(AuditKey, function(Current : unknown) : unknown?
+			-- Reset on each invocation: DataStore may retry the callback.
+			CallbackSucceeded = false
+			CallbackNeedsSharding = false
+			ShardingPayload = nil
+
+			local RemoteEntries : { AuditEntry } = {}
+			if Current ~= nil and typeof(Current) == "table" then
+				local RemoteTable = Current :: any
+				-- Another server sharded the log between our GetAsync and here;
+				-- abort so the next flush cycle takes the correct sharded path.
+				if typeof(RemoteTable._s) == "number" and RemoteTable._s > 0 then
+					return nil
+				end
+				if RemoteTable._c == true and typeof(RemoteTable._d) == "string" then
+					local DecompressResult = Compression.DecompressToString(RemoteTable._d :: string)
+					if DecompressResult.Passed then
+						local ParseOk, Parsed = pcall(HttpService.JSONDecode, HttpService,
+							(DecompressResult :: Types.SuccessResult<string>).Value)
+						if ParseOk and typeof(Parsed) == "table" then
+							RemoteEntries = Parsed :: any
+						end
+					end
+				end
+			end
+
+			local Merged : { AuditEntry } = {}
+			for _, Entry in RemoteEntries do table.insert(Merged, Entry) end
+			for _, Entry in LocalEntries do table.insert(Merged, Entry) end
+			while #Merged > MaxSize do table.remove(Merged, 1) end
+
+			local EncodeOk, Json = pcall(HttpService.JSONEncode, HttpService, Merged)
+			if not EncodeOk then return nil end
+
+			local CompressRes = Compression.CompressString(Json :: string)
+			if not CompressRes.Passed then return nil end
+
+			local NewPayload = (CompressRes :: Types.SuccessResult<string>).Value
+			if #NewPayload > ShardThreshold and ShardThreshold > 0 then
+				-- Merged result now exceeds the shard threshold (e.g. many entries
+				-- arrived from another server). Capture the payload and abort so
+				-- the caller can write it as shards outside the callback.
+				CallbackNeedsSharding = true
+				ShardingPayload = NewPayload
+				return nil
+			end
+
+			CallbackSucceeded = true
+			return { _c = true, _d = NewPayload }
+		end)
+	end)
+
+	if not UpdateOk then
+		warn(`[Nexus] _FlushAuditLog: UpdateAsync failed for '{AuditKey}': {UpdateErr} — dirty flag preserved for retry`)
+		return
+	end
+
+	if CallbackNeedsSharding and ShardingPayload ~= nil then
+		-- Overflow into sharding after the atomic merge. Write shards with
+		-- SetAsync (best-effort; no atomic multi-key primitive available).
+		local Chunks = Shard.Split(ShardingPayload :: string, ShardThreshold)
+		local NewShardCount = #Chunks
+
+		local ShardWriteResult = Shard.WriteShards(self._DataStore, AuditKey, Chunks, MaxRetries)
+		if not ShardWriteResult.Passed then
+			warn(`[Nexus] _FlushAuditLog: shard write failed for '{AuditKey}' — dirty flag preserved for retry`)
+			return
+		end
+
+		local ManifestOk, ManifestErr = pcall(function()
+			self._DataStore:SetAsync(AuditKey, { _s = NewShardCount })
+		end)
+		if not ManifestOk then
+			warn(`[Nexus] _FlushAuditLog: manifest SetAsync failed for '{AuditKey}': {ManifestErr}`)
+			return
+		end
+
+		self._AuditShardCounts[Key] = NewShardCount
+		self._AuditDirty[Key] = false
+		self:_DebugLog("AuditFlush.Sharded", Key)
+		return
+	end
+
+	if not CallbackSucceeded then
+		-- Callback aborted (remote was sharded by another server, or
+		-- encode/compress failed); dirty flag stays for next flush cycle.
+		return
+	end
+
+	if OldAuditShardCount > 0 then
+		Shard.DeleteAllShards(self._DataStore, AuditKey, OldAuditShardCount)
+		self._AuditShardCounts[Key] = 0
+	end
+
 	self._AuditDirty[Key] = false
+	self:_DebugLog("AuditFlush.Direct", Key)
 end
 
 function Store.GetAuditLogRemote<DataType>(self : StoreObject<DataType>, Key : string) : Result<{ AuditEntry }>
