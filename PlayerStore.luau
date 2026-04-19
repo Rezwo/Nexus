@@ -5,6 +5,7 @@ local Players = game:GetService("Players")
 local Types = require(script.Parent.Types)
 local Errors = require(script.Parent.Errors)
 local Signal = require(script.Parent.Signal)
+local Semaphore = require(script.Parent.Semaphore)
 local Store = require(script.Parent.Store)
 local Telemetry = require(script.Parent.Telemetry)
 local InboxModule = require(script.Parent.Inbox)
@@ -32,6 +33,7 @@ export type PlayerStoreConfiguration<DataType> = {
 	Strict : boolean?,
 	ShardThreshold : number?,
 	LockRetryTimeout : number?,
+	MaxConcurrentLoads : number?,
 	KickOnLoadFailure : boolean?,
 	KickMessage : string?,
 	Inbox : boolean?,
@@ -44,6 +46,7 @@ export type PlayerStoreObject<DataType> = {
 	_Configuration : PlayerStoreConfiguration<DataType>,
 	_Connections : { RBXScriptConnection },
 	_LoadingPlayers : { [number] : boolean },
+	_LoadSemaphore : Semaphore.SemaphoreObject,
 	_Inbox : InboxModule.InboxManager?,
 
 	OnPlayerLoaded : Signal<Player, DataType>,
@@ -102,6 +105,7 @@ function PlayerStore.New<DataType>(
 	self._Configuration = Configuration
 	self._Connections = {}
 	self._LoadingPlayers = {}
+	self._LoadSemaphore = Semaphore.New(Configuration.MaxConcurrentLoads or 10)
 	self._Inbox = nil
 
 	if Configuration.Inbox then
@@ -364,6 +368,7 @@ function PlayerStore.Destroy<DataType>(self : PlayerStoreObject<DataType>) : ()
 		self._Inbox:Destroy()
 	end
 
+	self._LoadSemaphore:Destroy()
 	self._Store:Destroy()
 
 	self.OnPlayerLoaded:Destroy()
@@ -395,7 +400,9 @@ function PlayerStore._LoadPlayer<DataType>(
 
 		local DeadlineTime = os.clock() + RetryTimeout
 		while true do
+			self._LoadSemaphore:Acquire()
 			LoadResult = self._Store:Load(Key)
+			self._LoadSemaphore:Release()
 			if LoadResult.Passed then
 				break
 			end
@@ -406,8 +413,9 @@ function PlayerStore._LoadPlayer<DataType>(
 			if os.clock() >= DeadlineTime then
 				break
 			end
+			-- Release semaphore slot during the retry wait so other players
+			-- can load concurrently while this one waits for a lock.
 			task.wait(2)
-
 
 			if not TargetPlayer:IsDescendantOf(Players) then
 				self._LoadingPlayers[UserId] = nil
@@ -415,7 +423,9 @@ function PlayerStore._LoadPlayer<DataType>(
 			end
 		end
 	else
+		self._LoadSemaphore:Acquire()
 		LoadResult = self._Store:Load(Key)
+		self._LoadSemaphore:Release()
 	end
 
 	self._LoadingPlayers[UserId] = nil

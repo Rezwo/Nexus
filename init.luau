@@ -171,7 +171,14 @@ function Nexus.Transact(
 			if TargetSession then
 				TargetSession._Data = Snapshot
 				TargetSession._Dirty = true
-				local PersistResult = TypedStore:Save(Key)
+				-- Bypass debounce: a crash during the debounce window would persist
+				-- the bad (pre-rollback) state on next load.
+				local DebounceThread = (TypedStore :: any)._DebounceTimers[Key]
+				if DebounceThread then
+					task.cancel(DebounceThread)
+					;(TypedStore :: any)._DebounceTimers[Key] = nil
+				end
+				local PersistResult = (TypedStore :: any):_PerformDebouncedSave(Key)
 				if not PersistResult.Passed then
 					warn(`[Nexus] Cross-store transaction: rollback persist failed for '{Key}'`)
 				end
