@@ -985,7 +985,7 @@ do
 	
 	-- Inject pure garbage into DataStore so UnpackEnvelope fails and fires OnError
 	-- Using a table with compression flag but invalid data string ensures decompression fails gracefully
-	local DS = game:GetService("DataStoreService"):GetDataStore("NexusDeep_OnErrorKey")
+	local DS = (_G.NexusMockDataStoreService or game:GetService("DataStoreService")):GetDataStore("NexusDeep_OnErrorKey")
 	pcall(function() DS:SetAsync("OEKey", { _v = 1, _c = true, _d = "invalid_compression_string" }) end)
 
 	Store:Load("OEKey")

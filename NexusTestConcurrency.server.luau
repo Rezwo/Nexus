@@ -66,6 +66,8 @@ do
 	
 	local LoadResult = Store:Load("ShutDownKey")
 	if LoadResult.Passed then
+		Store:Update("ShutDownKey", function(d) return d end)
+		MockDataStore.Fault("Concurrency_Shutdown", "UpdateAsync", "Fail during shutdown")
 		-- Simulate shutting down
 		local AnyStore = Store :: any
 		AnyStore._ShuttingDown = true
