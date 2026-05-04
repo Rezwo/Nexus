@@ -511,8 +511,9 @@ function Lock._StartHeartbeat(self : LockManager, Key : string) : ()
 
 			if LeaseWasStolen then
 				self._ActiveLeases[Key] = nil
-				if self._OnStolen and StealerJobId then
-					task.spawn(self._OnStolen, Key, StealerJobId)
+				local StolenHandler = self._OnStolen
+				if StolenHandler and StealerJobId then
+					task.spawn(StolenHandler, Key, StealerJobId)
 				end
 				break
 			end

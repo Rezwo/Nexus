@@ -10,8 +10,6 @@ local Validation = require(script.Parent.Validation)
 local Lock = require(script.Parent.Lock)
 local Circuit = require(script.Parent.Circuit)
 local SessionModule = require(script.Parent.Session)
--- Transaction module is used externally; Store.Transact uses inline CAS
--- via _CommitParticipantCAS.
 local Shard = require(script.Parent.Shard)
 local Compression = require(script.Parent.Compression)
 local Lifecycle = require(script.Parent.Lifecycle)
@@ -1373,7 +1371,7 @@ function Store._CommitParticipantCAS<DataType>(
 
 			self._LastKnownTxv[Key] = RemoteTransactionVersion + 1
 			local Metadata = { SchemaVersion = tostring(SchemaDefinition.Version) }
-			return CommitEnvelope, UserIds or {}, Metadata
+			return CommitEnvelope :: any, UserIds or {}, Metadata
 		end)
 		return true
 	end, { MaxRetries = self._Configuration.MaxRetries, BudgetType = "UpdateAsync" } :: any)
@@ -1442,8 +1440,9 @@ function Store.Transact<DataType>(
 				local RollbackEnvelopeResult = RollbackSession:BuildEnvelope()
 				if RollbackEnvelopeResult.Passed then
 					local RollbackEnvelope = (RollbackEnvelopeResult :: Types.SuccessResult<Envelope<DataType>>).Value
-					if self._LockManager then
-						local LockInfo = self._LockManager:ToLockInfo(CommittedKey)
+					local LockMgr = self._LockManager
+					if LockMgr then
+						local LockInfo = LockMgr:ToLockInfo(CommittedKey)
 						if LockInfo then RollbackEnvelope._lock = LockInfo end
 					end
 					local PersistResult = self:_WriteEnvelope(CommittedKey, RollbackEnvelope, RollbackSession:GetUserIds())
@@ -1602,8 +1601,8 @@ function Store.GetVersion<DataType>(self : StoreObject<DataType>, Key : string, 
 	local UnpackResult = SessionModule.UnpackEnvelope(RawVersionData, self._Configuration.Schema)
 	if not UnpackResult.Passed then return Errors.Fail((UnpackResult :: Types.ErrorResult).Error) end
 	local UnpackedData = (UnpackResult :: Types.SuccessResult<{ Data : DataType, Version : number }>).Value
-	local CreatedTime = if VersionKeyInfo ~= nil then (VersionKeyInfo :: any).CreatedTime or 0 else 0
-	return Errors.Passed({ Version = VersionId, CreatedTime = CreatedTime, Data = UnpackedData.Data, IsDeleted = RawVersionData == nil })
+	local CreatedTime : number = if VersionKeyInfo ~= nil then (VersionKeyInfo :: any).CreatedTime or 0 else 0
+	return Errors.Passed({ Version = VersionId, CreatedTime = CreatedTime, Data = UnpackedData.Data, IsDeleted = RawVersionData == nil } :: VersionEntry<DataType>)
 end
 
 function Store.Rollback<DataType>(self : StoreObject<DataType>, Key : string, VersionId : string) : Result<DataType>
