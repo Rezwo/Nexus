@@ -10,7 +10,8 @@ local Validation = require(script.Parent.Validation)
 local Lock = require(script.Parent.Lock)
 local Circuit = require(script.Parent.Circuit)
 local SessionModule = require(script.Parent.Session)
-local _Transaction = require(script.Parent.Transaction)
+-- Transaction module is used externally; Store.Transact uses inline CAS
+-- via _CommitParticipantCAS.
 local Shard = require(script.Parent.Shard)
 local Compression = require(script.Parent.Compression)
 local Lifecycle = require(script.Parent.Lifecycle)
@@ -1085,7 +1086,7 @@ function Store._WriteEnvelopeInner<DataType>(
 				return NewManifest, UserIds or {}, Metadata
 			end)
 			return true
-		end, { MaxRetries = RetryCount, BudgetType = "UpdateAsync" } :: any)
+		end, { MaxRetries = RetryCount, BudgetType = "UpdateAsync", SkipBudgetWait = self._ShuttingDown } :: any)
 
 		if not ManifestResult.Passed then
 			return Errors.Fail((ManifestResult :: Types.ErrorResult).Error)
@@ -1131,7 +1132,7 @@ function Store._WriteEnvelopeInner<DataType>(
 			return NewEnvelope, UserIds or {}, Metadata
 		end)
 		return true
-	end, { MaxRetries = RetryCount, BudgetType = "UpdateAsync" } :: any)
+	end, { MaxRetries = RetryCount, BudgetType = "UpdateAsync", SkipBudgetWait = self._ShuttingDown } :: any)
 
 	if not SaveResult.Passed then
 		return Errors.Fail((SaveResult :: Types.ErrorResult).Error)
@@ -1730,6 +1731,12 @@ function Store.NextPage<DataType>(self : StoreObject<DataType>, Cursor : PageCur
 end
 
 
+-- CAVEAT: SoftDelete does NOT acquire a session lock. If another server holds
+-- an active session for this key, its next auto-save will overwrite the
+-- _deleted tombstone, silently undoing the soft-delete. Callers should ensure
+-- no active session exists on any server before soft-deleting (e.g. by closing
+-- the session first, which this method does for the local server), or accept
+-- the race in multi-server scenarios where SoftDelete is used administratively.
 function Store.SoftDelete<DataType>(self : StoreObject<DataType>, Key : string) : Result<boolean>
 	if self._Sessions[Key] then
 		self:Close(Key)

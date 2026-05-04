@@ -183,18 +183,20 @@ function Inbox.Drain(
 ) : Result<{ InboxItem }>
 	local DrainedItems : { InboxItem } = {}
 	local StartTime = os.clock()
+	local WasCorrupt = false
 
 	local DrainResult = Retry.WrapPcall("DataStoreError", function()
 		self._DataStore:UpdateAsync(Key, function(CurrentData : unknown)
 
 			DrainedItems = {}
+			WasCorrupt = false
 
 			if CurrentData == nil then
 				return nil
 			end
 			local Items, Decoded = DecodeEnvelope(CurrentData)
 			if not Decoded then
-
+				WasCorrupt = true
 				warn(`[Nexus] Inbox.Drain: failed to decode inbox for '{Key}', skipping drain`)
 				return nil
 			end
@@ -211,10 +213,17 @@ function Inbox.Drain(
 		BudgetType = "UpdateAsync",
 	} :: any)
 
-	Telemetry.Record("Inbox.Drain", os.clock() - StartTime, DrainResult.Passed)
+	Telemetry.Record("Inbox.Drain", os.clock() - StartTime, DrainResult.Passed and not WasCorrupt)
 
 	if not DrainResult.Passed then
 		return Errors.Fail((DrainResult :: Types.ErrorResult).Error)
+	end
+
+	if WasCorrupt then
+		return Errors.Fail(Errors.New("DataStoreError",
+			`Inbox for '{Key}' contains unreadable data. Drain aborted to prevent silent item loss.`,
+			{ Key = Key }
+		))
 	end
 
 	return Errors.Passed(DrainedItems)

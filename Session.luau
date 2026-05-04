@@ -102,7 +102,10 @@ function Session.Update<DataType>(
 	self : SessionObject<DataType>,
 	Transform : (Data : DataType) -> DataType?
 ) : Result<DataType>
-	if self._Status ~= "Active" then
+	-- Allow updates while the session is "Saving". BuildEnvelope already
+	-- captured the data snapshot before the write began, so mutations here
+	-- are safe — they just keep the session dirty for the next save cycle.
+	if self._Status ~= "Active" and self._Status ~= "Saving" then
 		return Errors.Fail(Errors.New("SessionClosed",
 			`Session '{self._Key}' is {self._Status}, cannot update`,
 			{ Key = self._Key }
@@ -165,7 +168,8 @@ function Session.QueueAction<DataType>(
 	self : SessionObject<DataType>,
 	Action : (Data : DataType) -> DataType?
 ) : Result<boolean>
-	if self._Status ~= "Active" then
+	-- Allow queuing while "Saving" — same reasoning as Session.Update.
+	if self._Status ~= "Active" and self._Status ~= "Saving" then
 		return Errors.Fail(Errors.New("SessionClosed",
 			`Session '{self._Key}' is {self._Status}`,
 			{ Key = self._Key }

@@ -185,6 +185,10 @@ export type RetryConfiguration = {
 	MaxRetries : number?,
 	BudgetType : BudgetType?,
 	OnRetry : ((Attempt : number, Delay : number, LastError : NexusError) -> ())?,
+	-- When true, skip the blocking Budget.WaitForCapacity call and proceed
+	-- immediately. Used during BindToClose to avoid parking for up to 60s
+	-- when Roblox only gives 30s of shutdown budget.
+	SkipBudgetWait : boolean?,
 }
 
 export type StoreCallbacks<DataType> = {

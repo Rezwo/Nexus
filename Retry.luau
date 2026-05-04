@@ -30,6 +30,7 @@ function Retry.Execute<Value>(
 	local MaximumRetries = Config.MaxRetries or DEFAULT_MAXIMUM_RETRIES
 	local RequestBudgetType = Config.BudgetType
 	local OnRetryCallback = Config.OnRetry
+	local SkipBudgetWait = Config.SkipBudgetWait or false
 
 	local LastError : NexusError? = nil
 
@@ -37,7 +38,10 @@ function Retry.Execute<Value>(
 		-- Gate on request budget for every attempt, not just retries. Without
 		-- this, the first attempt could immediately throttle against an empty
 		-- budget and consume a retry allotment for no reason.
-		if RequestBudgetType then
+		-- When SkipBudgetWait is true (e.g. during BindToClose shutdown),
+		-- skip the blocking wait to avoid exceeding Roblox's 30-second
+		-- shutdown window. The DataStore call proceeds regardless.
+		if RequestBudgetType and not SkipBudgetWait then
 			local BudgetResult = Budget.WaitForCapacity(RequestBudgetType)
 			if not BudgetResult.Passed then
 				return Errors.Fail(Errors.New("BudgetExhausted",
