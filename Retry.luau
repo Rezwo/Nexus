@@ -35,12 +35,8 @@ function Retry.Execute<Value>(
 	local LastError : NexusError? = nil
 
 	for Attempt = 0, MaximumRetries do
-		-- Gate on request budget for every attempt, not just retries. Without
-		-- this, the first attempt could immediately throttle against an empty
-		-- budget and consume a retry allotment for no reason.
-		-- When SkipBudgetWait is true (e.g. during BindToClose shutdown),
-		-- skip the blocking wait to avoid exceeding Roblox's 30-second
-		-- shutdown window. The DataStore call proceeds regardless.
+		-- Gate on budget for every attempt. SkipBudgetWait bypasses the
+		-- blocking wait during BindToClose to stay within the 30s window.
 		if RequestBudgetType and not SkipBudgetWait then
 			local BudgetResult = Budget.WaitForCapacity(RequestBudgetType)
 			if not BudgetResult.Passed then

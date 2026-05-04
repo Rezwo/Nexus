@@ -1730,12 +1730,8 @@ function Store.NextPage<DataType>(self : StoreObject<DataType>, Cursor : PageCur
 end
 
 
--- CAVEAT: SoftDelete does NOT acquire a session lock. If another server holds
--- an active session for this key, its next auto-save will overwrite the
--- _deleted tombstone, silently undoing the soft-delete. Callers should ensure
--- no active session exists on any server before soft-deleting (e.g. by closing
--- the session first, which this method does for the local server), or accept
--- the race in multi-server scenarios where SoftDelete is used administratively.
+-- NOTE: Does not acquire a lock. Another server's active session can overwrite
+-- the _deleted tombstone on its next save, undoing the soft-delete.
 function Store.SoftDelete<DataType>(self : StoreObject<DataType>, Key : string) : Result<boolean>
 	if self._Sessions[Key] then
 		self:Close(Key)
